@@ -1,17 +1,35 @@
 version: "3.8"
+
 services:
   postgres:
     image: postgres:15
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: dtrade
-      POSTGRES_PASSWORD: secret
-      POSTGRES_DB: dtrade
-    ports: ["5432:5432"]
-    volumes: ["pgdata:/var/lib/postgresql/data"]
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    networks:
+      - tonnet
 
   redis:
     image: redis:7
-    ports: ["6379:6379"]
+    restart: unless-stopped
+    command: redis-server --requirepass "${REDIS_PASSWORD}"
+    volumes:
+      - redisdata:/data
+    expose:
+      - "6379"
+    networks:
+      - tonnet
 
 volumes:
   pgdata:
+  redisdata:
+
+networks:
+  tonnet:
+    driver: bridge
