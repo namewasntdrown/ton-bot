@@ -1,16 +1,19 @@
 {
-  "name": "ton-bot-bot",
+  "name": "wallet-api",
   "private": true,
   "scripts": {
-    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "dev": "ts-node-dev --respawn --transpile-only src/main.ts"
   },
   "dependencies": {
-    "axios": "^1.13.1",
+    "@fastify/cors": "^11.1.0",
+    "@ton/crypto": "^3.3.0",
+    "@ton/ton": "^16.0.0",
     "dotenv": "^16.4.5",
-    "telegraf": "^4.16.3"
+    "envalid": "^8.1.1",
+    "fastify": "^5.6.1",
+    "zod": "^3.23.8",
+    "pg": "^8.16.3",
+    "ton-bot-monorepo": "file:../.."
   },
   "devDependencies": {
     "@types/node": "^20.11.30",

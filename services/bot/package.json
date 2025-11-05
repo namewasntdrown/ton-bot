@@ -10,7 +10,8 @@
   "dependencies": {
     "axios": "^1.13.1",
     "dotenv": "^16.4.5",
-    "telegraf": "^4.16.3"
+    "telegraf": "^4.16.3",
+    "ton-bot-monorepo": "file:../.."
   },
   "devDependencies": {
     "@types/node": "^20.11.30",
