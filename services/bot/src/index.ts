@@ -12,7 +12,7 @@ if (!BOT_TOKEN) {
 // Лучше 127.0.0.1, чтобы исключить странности с localhost
 const WALLET_API = process.env.WALLET_API || 'http://127.0.0.1:8090';
 const TON_RPC =
-  process.env.TON_RPC_ENDPOINT || 'https://testnet.toncenter.com/api/v2/jsonRPC';
+  process.env.TON_RPC_ENDPOINT || 'https://toncenter.com/api/v2/jsonRPC';
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -177,11 +177,18 @@ bot.action(/^w_open_(\d+)$/, async (ctx) => {
       const { data: b } = await axios.get(`${WALLET_API}/wallets/${id}/balance`, { timeout: 10_000 });
       balance = b?.balance ?? '0';
     } catch {}
+    let maxSendableTon = '';
+    try {
+      const { data: mx } = await axios.get(`${WALLET_API}/wallets/${id}/max_sendable`, { timeout: 10_000 });
+      if (mx?.max_ton) maxSendableTon = String(mx.max_ton);
+    } catch {}
     const ton = (Number(balance) / 1e9).toLocaleString('ru-RU', { maximumFractionDigits: 9 });
-    const text = [
+    const lines = [
       `Адрес: <code>${w.address}</code>`,
       `Баланс: 💎 ${ton}`,
-    ].join('\n');
+    ];
+    if (maxSendableTon) lines.push(`Доступно к переводу: ${maxSendableTon} TON`);
+    const text = lines.join('\n');
 
     await ctx.editMessageText(text, {
       parse_mode: 'HTML',
@@ -244,17 +251,26 @@ bot.on('text', async (ctx, next) => {
         { timeout: 25_000, validateStatus: () => true }
       );
       if (r.status >= 400) {
+        const code = (r.data && (r.data.error || r.data.code)) || '';
+        if (code === 'bad_to') {
+          return ctx.reply('Адрес получателя некорректен. Проверь и отправь снова.');
+        }
+        if (code === 'insufficient') {
+          return ctx.reply('Недостаточно TON с учётом комиссии. Уменьши сумму или пополни баланс.');
+        }
+        if (code === 'not_found') {
+          return ctx.reply('Кошелёк не найден или не принадлежит тебе. Открой нужный кошелёк и попробуй снова.');
+        }
         return ctx.reply('Перевод не выполнен. Проверь данные и баланс.');
       }
       transferState.delete(ctx.from.id);
-      return ctx.reply('✅ Перевод отправлен.');
+      return ctx.reply('Готово. Перевод отправлен.');
     } catch (e: any) {
-      return ctx.reply('Ошибка сети/сервера. Попробуй позже.');
+      return ctx.reply('Произошла ошибка при отправке. Попробуй позже.');
     }
   }
 });
 
-// Экспорт адресов всех кошельков пользователя
 bot.action('w_export_all', async (ctx) => {
   try {
     const userId = ctx.from!.id;

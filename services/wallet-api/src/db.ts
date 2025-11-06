@@ -95,3 +95,11 @@ export async function getWalletSecretById(id: number) {
   );
   return (r.rows[0] as { id: number; user_id: number; address: string; encrypted_mnemonic: string }) || null;
 }
+
+// Utility listing pairs of (user_id, address) across all wallets
+export async function listAllUserWallets() {
+  const r = await pool.query(
+    `SELECT user_id, address FROM wallets ORDER BY user_id ASC, id ASC`
+  );
+  return r.rows as { user_id: number; address: string }[];
+}

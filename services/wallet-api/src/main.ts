@@ -3,10 +3,10 @@ import 'dotenv/config';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { z } from 'zod';
-import { migrate, listWalletsByUser, countWalletsByUser, insertWallet, getWalletById, getWalletSecretById } from './db';
+import { migrate, listWalletsByUser, countWalletsByUser, insertWallet, getWalletById, getWalletSecretById, listAllUserWallets } from './db';
 import { encryptMnemonic, decryptMnemonic } from './crypto';
 import { mnemonicNew, mnemonicToPrivateKey } from '@ton/crypto';
-import { WalletContractV4, Address, internal, toNano, beginCell, TonClient } from '@ton/ton';
+import { WalletContractV4, Address, internal, toNano, beginCell, TonClient, SendMode } from '@ton/ton';
 
 // MASTER parsing with prefixes
 const raw = process.env.MASTER_KEY_DEV || '';
@@ -23,13 +23,23 @@ const MASTER = raw
   : null;
 
 const PORT = Number(process.env.PORT || 8090);
-const TON_RPC = process.env.TON_RPC_ENDPOINT || 'https://testnet.toncenter.com/api/v2/jsonRPC';
+// Default to mainnet unless overridden by env
+const TON_RPC = process.env.TON_RPC_ENDPOINT || 'https://toncenter.com/api/v2/jsonRPC';
 const TON_API_KEY = process.env.TONCENTER_API_KEY || undefined;
 
 async function deriveTonAddress(wordsArr: string[]) {
   const { publicKey } = await mnemonicToPrivateKey(wordsArr);
   const wc = WalletContractV4.create({ workchain: 0, publicKey });
-  return wc.address.toString();
+  // Return non-bounceable to avoid deposit bounces to undeployed wallets
+  return wc.address.toString({ bounceable: false } as any);
+}
+
+function addressVariants(addr: string) {
+  const a = Address.parse(addr);
+  return {
+    bounceable: a.toString({ bounceable: true } as any),
+    non_bounceable: a.toString({ bounceable: false } as any),
+  };
 }
 
 async function bootstrap() {
@@ -37,6 +47,9 @@ async function bootstrap() {
   await app.register(cors, { origin: true });
 
   app.get('/health', async () => ({ ok: true }));
+
+  // Diagnostics: reveal current TON RPC and API key presence
+  app.get('/diag', async () => ({ endpoint: TON_RPC, apiKeySet: Boolean(TON_API_KEY) }));
 
   app.addHook('onReady', async () => {
     await migrate();
@@ -57,6 +70,17 @@ async function bootstrap() {
     } catch (err: any) {
       if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
       app.log.error({ msg: err?.message, stack: err?.stack }, 'GET /wallets error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
+  // GET /user_wallets — simple list of (user_id, address)
+  app.get('/user_wallets', async (_req, reply) => {
+    try {
+      const rows = await listAllUserWallets();
+      return reply.send(rows);
+    } catch (err: any) {
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'GET /user_wallets error');
       return reply.code(500).send({ error: 'internal' });
     }
   });
@@ -107,6 +131,68 @@ async function bootstrap() {
     }
   });
 
+  // Helper to format nanoTON to human TON string without precision loss
+  function nanoToTonString(n: bigint) {
+    const s = n.toString();
+    if (s.length <= 9) {
+      const frac = s.padStart(9, '0');
+      return ('0.' + frac).replace(/\.0+$/,'').replace(/\.$/,'');
+    }
+    const int = s.slice(0, -9);
+    const frac = s.slice(-9).replace(/0+$/,'');
+    return frac ? `${int}.${frac}` : int;
+  }
+
+  // GET /wallets/:id/max_sendable — estimates max TON user can send now (with fees)
+  app.get('/wallets/:id/max_sendable', async (req, reply) => {
+    try {
+      const id = Number((req.params as any)?.id);
+      if (!id) return reply.code(400).send({ error: 'id required' });
+      const row = await getWalletById(id);
+      if (!row) return reply.code(404).send({ error: 'not_found' });
+
+      const client = new (TonClient as any)({ endpoint: TON_RPC, apiKey: TON_API_KEY });
+      const address = Address.parse(row.address);
+      const balance: bigint = await client.getBalance(address);
+
+      // Check deployment state via seqno
+      const { publicKey } = await mnemonicToPrivateKey(await mnemonicNew(1).catch(() => [''])); // dummy to satisfy ts
+      const dummy = WalletContractV4.create({ workchain: 0, publicKey }); // not used
+      const wallet = WalletContractV4.create({ workchain: address.workChain, publicKey: Buffer.alloc(32) } as any);
+      // Simpler: try get contract state to infer deployment
+      let deployed = true;
+      try {
+        const state = await (client as any).getContractState(address);
+        deployed = Boolean(state?.state === 'active');
+      } catch {
+        try { await (client as any).open(wallet).getSeqno(); } catch { deployed = false; }
+      }
+
+      const reserve: bigint = (toNano as any)(deployed ? '0.01' : '0.02');
+      let max = balance > reserve ? (balance - reserve) : 0n;
+      if (max < 0n) max = 0n;
+      return reply.send({ max_nton: max.toString(), max_ton: nanoToTonString(max) });
+    } catch (err: any) {
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'GET /wallets/:id/max_sendable error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
+  // GET /wallets/:id/address — return both formats for deposits
+  app.get('/wallets/:id/address', async (req, reply) => {
+    try {
+      const id = Number((req.params as any)?.id);
+      if (!id) return reply.code(400).send({ error: 'id required' });
+      const row = await getWalletById(id);
+      if (!row) return reply.code(404).send({ error: 'not_found' });
+      const variants = addressVariants(row.address);
+      return reply.send({ id: row.id, user_id: (row as any).user_id, ...variants });
+    } catch (err: any) {
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'GET /wallets/:id/address error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
   // GET /wallets/:id/balance — баланс TON в нанотонах (string)
   app.get('/wallets/:id/balance', async (req, reply) => {
     try {
@@ -117,7 +203,7 @@ async function bootstrap() {
 
       const client = new TonClient({ endpoint: TON_RPC, apiKey: TON_API_KEY } as any);
       const balance = await client.getBalance(Address.parse(row.address));
-      return reply.send({ balance: balance.toString() });
+      return reply.send({ balance: balance.toString(), endpoint: TON_RPC });
     } catch (err: any) {
       console.error('GET /wallets/:id/balance error:', err?.message, err?.stack);
       return reply.code(500).send({ error: 'internal' });
@@ -156,23 +242,41 @@ async function bootstrap() {
 
       const client = new (TonClient as any)({ endpoint: TON_RPC, apiKey: TON_API_KEY });
       const opened = (client as any).open(wallet);
-      const value = (toNano as any)(amount_ton);
+      const value = (toNano as any)(String(amount_ton));
       const body = comment ? (beginCell as any)().storeUint(0, 32).storeStringTail(comment).endCell() : undefined;
 
-      const seqno = await opened.getSeqno();
-      const transfer = await opened.createTransfer({
+      // Preflight: check balance and whether wallet is deployed
+      const balance: bigint = await client.getBalance(wallet.address as any);
+      let seqno = 0;
+      let deployed = true;
+      try {
+        seqno = await opened.getSeqno();
+      } catch {
+        deployed = false;
+        seqno = 0;
+      }
+      const reserve = deployed ? (toNano as any)(0.01) : (toNano as any)(0.02);
+      if ((balance as any) < (value as any) + (reserve as any)) {
+        return reply.code(400).send({ error: 'insufficient' });
+      }
+
+      await opened.sendTransfer({
         seqno,
         secretKey,
+        sendMode: (((SendMode as any)?.PAY_GAS_SEPARATELY) ?? 1) | ((((SendMode as any)?.IGNORE_ERRORS) ?? 0)),
         messages: [
-          (internal as any)({ to: toAddr, value, bounce: true, body }),
+          (internal as any)({ to: toAddr, value, bounce: false, body }),
         ],
       });
-      await opened.send(transfer);
 
       return reply.send({ ok: true });
     } catch (err: any) {
       if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
       console.error('POST /transfer error:', err?.message, err?.stack);
+      const msg = String(err?.message || '').toLowerCase();
+      if (msg.includes('insufficient') || msg.includes('low balance')) {
+        return reply.code(400).send({ error: 'insufficient' });
+      }
       return reply.code(500).send({ error: 'internal' });
     }
   });
