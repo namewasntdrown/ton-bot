@@ -42,6 +42,19 @@ function addressVariants(addr: string) {
   };
 }
 
+function asBooleanFlag(value: unknown) {
+  if (typeof value === 'string') {
+    return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+  }
+  if (typeof value === 'number') {
+    return value !== 0;
+  }
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  return false;
+}
+
 async function bootstrap() {
   const app = Fastify({ logger: true });
   await app.register(cors, { origin: true });
@@ -62,11 +75,37 @@ async function bootstrap() {
 
   app.get('/wallets', async (req, reply) => {
     try {
-      const { user_id } = QueryUserId.parse((req.query ?? {}) as any);
+      const query = (req.query ?? {}) as any;
+      const { user_id } = QueryUserId.parse(query);
       const userId = user_id;
+      const includeBalance = asBooleanFlag(query?.with_balance ?? query?.include_balance);
 
       const rows = await listWalletsByUser(userId);
-      return reply.send(rows);
+      if (!rows.length || !includeBalance) {
+        return reply.send(rows);
+      }
+
+      const client = new (TonClient as any)({ endpoint: TON_RPC, apiKey: TON_API_KEY });
+      const enriched = await Promise.all(
+        rows.map(async (row) => {
+          try {
+            const balance = await client.getBalance(Address.parse(row.address));
+            return {
+              ...row,
+              balance_nton: balance.toString(),
+              balance_ton: nanoToTonString(balance),
+            };
+          } catch (err: any) {
+            app.log.warn(
+              { msg: err?.message, userId, walletId: row.id, address: row.address },
+              'wallet_balance_fetch_failed'
+            );
+            return { ...row, balance_nton: null, balance_ton: null };
+          }
+        })
+      );
+
+      return reply.send(enriched);
     } catch (err: any) {
       if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
       app.log.error({ msg: err?.message, stack: err?.stack }, 'GET /wallets error');

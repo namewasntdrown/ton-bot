@@ -2,6 +2,12 @@
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import axios from 'axios';
+import { sendView, ViewMode } from './utils/telegram';
+import {
+  handleTokenTextMessage,
+  registerTradingActions,
+  renderTradingMenu,
+} from './trading';
 
 const BOT_TOKEN = process.env.BOT_TOKEN!;
 if (!BOT_TOKEN) {
@@ -15,6 +21,159 @@ const TON_RPC =
   process.env.TON_RPC_ENDPOINT || 'https://toncenter.com/api/v2/jsonRPC';
 
 const bot = new Telegraf(BOT_TOKEN);
+const NANO_IN_TON = 1_000_000_000n;
+
+function toNanoBigInt(value: unknown): bigint {
+  try {
+    if (typeof value === 'bigint') return value;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return BigInt(Math.trunc(value));
+    }
+    if (typeof value === 'string' && value.trim()) {
+      return BigInt(value.trim());
+    }
+  } catch {
+    // ignore and fall through
+  }
+  return 0n;
+}
+
+function formatTonFromNano(value: unknown): string {
+  let nano = toNanoBigInt(value);
+  const negative = nano < 0n;
+  if (negative) nano = -nano;
+  const intPart = nano / NANO_IN_TON;
+  let frac = (nano % NANO_IN_TON).toString().padStart(9, '0').replace(/0+$/, '');
+  const base = frac ? `${intPart}.${frac}` : `${intPart}`;
+  return negative ? `-${base}` : base;
+}
+
+type WalletRecord = {
+  id: number;
+  address: string;
+  balance?: string | null;
+  balance_nton?: string | null;
+  balanceNton?: string | null;
+};
+
+async function fetchWalletsWithBalance(userId: number): Promise<WalletRecord[]> {
+  const { data } = await axios.get(`${WALLET_API}/wallets`, {
+    params: { user_id: userId, with_balance: 1 },
+    timeout: 10_000,
+  });
+  return Array.isArray(data) ? data : [];
+}
+
+async function renderMainMenu(ctx: any, mode: ViewMode = 'edit') {
+  const userId = ctx.from?.id;
+  let walletsLabel = 'Кошельки 👛';
+  if (userId) {
+    try {
+      const wallets = await fetchWalletsWithBalance(userId);
+      const total = wallets.reduce(
+        (sum, w) => sum + toNanoBigInt(w.balance_nton ?? w.balance ?? w.balanceNton ?? 0),
+        0n
+      );
+      walletsLabel = `Кошельки 👛 [ ${formatTonFromNano(total)} 💎 ]`;
+    } catch {
+      // ignore and keep default label
+    }
+  }
+
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🏆 Торговый конкурс', 'menu_competition')],
+    [Markup.button.callback(walletsLabel, 'menu_wallets'), Markup.button.callback('💼 Позиции', 'menu_positions')],
+    [Markup.button.callback('🚀 Торговля', 'menu_transfer'), Markup.button.callback('🔎 Поиск токенов', 'menu_tokens')],
+    [Markup.button.callback('🤖 Копи-трейдинг', 'menu_copytrade'), Markup.button.callback('🎯 Снайпы', 'menu_snipes')],
+    [Markup.button.callback('🧱 Лимитки [BETA]', 'menu_limits'), Markup.button.callback('🤝 Рефералка', 'menu_ref')],
+    [Markup.button.callback('🆘 Помощь', 'menu_help'), Markup.button.callback('⚙️ Настройки', 'menu_settings')],
+    [Markup.button.callback('📚 Руководство', 'menu_guide')],
+  ]);
+  const text =
+    'Привет! Я помогу тебе торговать на TON быстрее всех 🚀\n\nВыбирай раздел ниже:';
+  return sendView(ctx, text, keyboard, mode);
+}
+
+async function renderWalletsMenu(ctx: any, mode: ViewMode = 'edit') {
+  const userId = ctx.from?.id;
+  if (!userId) {
+    return sendView(
+      ctx,
+      'Не удалось определить пользователя.',
+      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Меню', 'menu_home')]]),
+      mode
+    );
+  }
+
+  try {
+    const wallets = await fetchWalletsWithBalance(userId);
+    if (!Array.isArray(wallets) || wallets.length === 0) {
+      const text = 'Кошельки 👛 [ 0 💎 ]\nУ тебя пока нет кошельков.';
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🆕 Новый кошелёк', 'w_new')],
+        [Markup.button.callback('⬅️ Меню', 'menu_home')],
+      ]);
+      return sendView(ctx, text, keyboard, mode);
+    }
+
+    let total = 0n;
+    const rows = wallets.map((w) => {
+      const balanceNano = toNanoBigInt(w.balance_nton ?? w.balance ?? w.balanceNton ?? 0);
+      total += balanceNano;
+      const address = String(w.address || '');
+      const label = `${address.slice(-6) || address || '??????'} · 💎 ${formatTonFromNano(
+        balanceNano
+      )}`;
+      return [Markup.button.callback(label, `w_open_${w.id}`)];
+    });
+    rows.push([Markup.button.callback('🆕 Новый кошелёк', 'w_new')]);
+    rows.push([Markup.button.callback('⬅️ Меню', 'menu_home')]);
+
+    const text = `Кошельки 👛 [ ${formatTonFromNano(total)} 💎 ]\nВсего кошельков: ${
+      wallets.length
+    }`;
+    return sendView(ctx, text, Markup.inlineKeyboard(rows), mode);
+  } catch (err) {
+    const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Меню', 'menu_home')]]);
+    return sendView(
+      ctx,
+      'Сервис кошельков недоступен. Попробуй позже.',
+      keyboard,
+      mode
+    );
+  }
+}
+
+async function removeLegacyKeyboard(ctx: any) {
+  if (!ctx?.chat) return;
+  try {
+    const msg = await ctx.reply('Меню обновлено. Используй кнопки под сообщением 👇', {
+      reply_markup: { remove_keyboard: true },
+      disable_notification: true,
+    });
+    setTimeout(() => {
+      ctx.telegram?.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+    }, 1500);
+  } catch {
+    // ignore cleanup failures
+  }
+}
+
+const legacyReplyButtons = new Set([
+  'Мои кошельки👛',
+  '🏆 Торговый конкурс',
+  '💼 Позиции',
+  '💸 Перевод',
+  '🚀 Торговля',
+  '🔎 Поиск токенов',
+  '🤖 Копи-трейдинг',
+  '🎯 Снайпы',
+  '🧱 Лимитки [BETA]',
+  '🤝 Рефералка',
+  '🆘 Помощь',
+  '⚙️ Настройки',
+  '📚 Руководство',
+]);
 
 // ---------- утилиты ----------
 
@@ -40,18 +199,6 @@ async function pingWalletApi(): Promise<boolean> {
   }
 }
 
-// ---------- меню ----------
-
-const mainMenu = Markup.keyboard([
-  [Markup.button.text('💼 Мой кошелёк')],
-  [Markup.button.text('🏆 Торговый конкурс'), Markup.button.text('💼 Позиции')],
-  [Markup.button.text('💸 Перевод'), Markup.button.text('🔎 Поиск токенов')],
-  [Markup.button.text('🤖 Копи-трейдинг'), Markup.button.text('🎯 Снайпы')],
-  [Markup.button.text('🧱 Лимитки [BETA]'), Markup.button.text('🤝 Рефералка')],
-  [Markup.button.text('🆘 Помощь'), Markup.button.text('⚙️ Настройки')],
-  [Markup.button.text('📚 Руководство'), Markup.button.text('💰 Баланс')],
-]).resize();
-
 // ---------- команды ----------
 
 bot.start(async (ctx) => {
@@ -67,8 +214,14 @@ bot.start(async (ctx) => {
     console.error('wallet-api check error:', e?.response?.data || e?.message);
   }
 
-  // Приветствие и меню (всегда показываем)
-  await ctx.reply('Привет! Я помогу тебе торговать на TON быстрее всех 🚀', mainMenu);
+  // Приветствие и главное меню (inline)
+  await removeLegacyKeyboard(ctx);
+  await renderMainMenu(ctx, 'reply');
+});
+
+bot.command('menu', async (ctx) => {
+  await removeLegacyKeyboard(ctx);
+  await renderMainMenu(ctx, 'reply');
 });
 
 bot.command('help', async (ctx) => {
@@ -78,70 +231,93 @@ bot.command('help', async (ctx) => {
       '/start — запуск и получение кошелька',
       '/help — эта справка',
       '',
-      'Меню внизу экрана содержит быстрые действия.',
+      'Используй кнопки под последним сообщением, чтобы управлять ботом.',
     ].join('\n')
   );
 });
 
-bot.hears('💰 Баланс', async (ctx) => {
-  // демо-адрес, просто проверка RPC
-  const testAddress = 'EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c';
-  try {
-    const payload = {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'getAddressInformation',
-      params: { address: testAddress },
-    };
-    const { data } = await axios.post(TON_RPC, payload, { timeout: 10_000 });
-    const balance = data?.result?.balance ? Number(data.result.balance) / 1e9 : 0;
-    await ctx.reply(
-      `Баланс адреса (демо): ${balance} TON\n\nRaw: ${JSON.stringify(data.result ?? data)}`
-    );
-  } catch (e: any) {
-    await ctx.reply(`Не смог получить баланс от RPC: ${e.message}`);
-  }
+// ---------- inline меню ----------
+
+bot.action('menu_home', async (ctx) => {
+  await ctx.answerCbQuery();
+  await renderMainMenu(ctx);
 });
 
-bot.hears('🎯 Снайпы', (ctx) =>
-  ctx.reply('Снайпер: скоро добавим стратегию и подписку на листинги.')
-);
-bot.hears('🤖 Копи-трейдинг', (ctx) =>
-  ctx.reply('Копитрейдинг: список трейдеров появится позже.')
-);
+bot.action('menu_wallets', async (ctx) => {
+  await ctx.answerCbQuery();
+  await renderWalletsMenu(ctx);
+});
+
+bot.action('menu_transfer', async (ctx) => {
+  await ctx.answerCbQuery();
+  await renderTradingMenu(ctx);
+});
+
+registerTradingActions(bot);
+
+const stubViews: Record<
+  string,
+  { title: string; text: string }
+> = {
+  menu_competition: {
+    title: '🏆 Торговый конкурс',
+    text: 'Скоро объявим детали конкурса и призы. Следи за новостями!'
+  },
+  menu_positions: {
+    title: '💼 Позиции',
+    text: 'Мониторинг позиций появится чуть позже.'
+  },
+  menu_tokens: {
+    title: '🔎 Поиск токенов',
+    text: 'Мы работаем над удобным поиском и аналитикой токенов.'
+  },
+  menu_copytrade: {
+    title: '🤖 Копи-трейдинг',
+    text: 'Копитрейдинг: список трейдеров появится позже.'
+  },
+  menu_snipes: {
+    title: '🎯 Снайпы',
+    text: 'Снайпер: скоро добавим стратегию и подписку на листинги.'
+  },
+  menu_limits: {
+    title: '🧱 Лимитки [BETA]',
+    text: 'Раздел лимитных ордеров готовится к запуску.'
+  },
+  menu_ref: {
+    title: '🤝 Рефералка',
+    text: 'Программа рекомендаций скоро откроется. Приглашай друзей и получай бонусы!'
+  },
+  menu_help: {
+    title: '🆘 Помощь',
+    text: 'Возник вопрос? Напиши в поддержку — мы поможем как можно быстрее.'
+  },
+  menu_settings: {
+    title: '⚙️ Настройки',
+    text: 'Персональные настройки появятся в одном из ближайших релизов.'
+  },
+  menu_guide: {
+    title: '📚 Руководство',
+    text: 'Готовим подробное руководство по боту. Пока что следи за обновлениями.'
+  },
+};
+
+Object.entries(stubViews).forEach(([action, view]) => {
+  if (action === 'menu_wallets') return;
+  bot.action(action, async (ctx) => {
+    await ctx.answerCbQuery();
+    await sendView(
+      ctx,
+      `${view.title}\n\n${view.text}`,
+      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Меню', 'menu_home')]])
+    );
+  });
+});
+
+bot.action('noop', async (ctx) => {
+  await ctx.answerCbQuery('Скоро 😊');
+});
 
 // --------------- Кошельки ---------------
-
-bot.hears('💼 Мой кошелёк', async (ctx) => {
-  const userId = ctx.from.id;
-  try {
-    const { data: wallets } = await axios.get(`${WALLET_API}/wallets`, {
-      params: { user_id: userId },
-      timeout: 10_000,
-    });
-
-    if (!Array.isArray(wallets) || wallets.length === 0) {
-      return ctx.reply(
-        'У тебя пока нет кошельков.',
-        Markup.inlineKeyboard([
-          [Markup.button.callback('🆕 Новый', 'w_new')],
-          [Markup.button.callback('⬅️ Назад', 'w_back')],
-        ])
-      );
-    }
-
-    const buttons = wallets.map((w: any) => [
-      Markup.button.callback(`${String(w.address).slice(-6)} · 💎 0`, `w_open_${w.id}`),
-    ]);
-
-    await ctx.reply(
-      `У тебя: ${wallets.length} кошелёк(а)\nОбщий баланс: 💎 0`,
-      Markup.inlineKeyboard([...buttons, [Markup.button.callback('🆕 Новый', 'w_new')]])
-    );
-  } catch (e: any) {
-    await ctx.reply('Сервис кошельков недоступен. Попробуй позже.');
-  }
-});
 
 bot.action('w_new', async (ctx) => {
   try {
@@ -163,6 +339,7 @@ bot.action('w_new', async (ctx) => {
 
     await ctx.answerCbQuery('Создан');
     await ctx.reply(`✅ Кошелёк создан:\n<code>${r.data.address}</code>`, { parse_mode: 'HTML' });
+    await renderWalletsMenu(ctx);
   } catch (e: any) {
     await ctx.answerCbQuery('Ошибка сервера');
   }
@@ -170,6 +347,7 @@ bot.action('w_new', async (ctx) => {
 
 bot.action(/^w_open_(\d+)$/, async (ctx) => {
   try {
+    await ctx.answerCbQuery();
     const id = Number((ctx.match as RegExpMatchArray)[1]);
     const { data: w } = await axios.get(`${WALLET_API}/wallets/${id}`, { timeout: 10_000 });
     let balance = '0';
@@ -204,9 +382,8 @@ bot.action(/^w_open_(\d+)$/, async (ctx) => {
 });
 
 bot.action('w_back', async (ctx) => {
-  try {
-    await ctx.deleteMessage();
-  } catch {}
+  await ctx.answerCbQuery();
+  await renderWalletsMenu(ctx);
 });
 
 // ---- Перевод ----
@@ -226,8 +403,19 @@ bot.command('cancel', async (ctx) => {
 });
 
 bot.on('text', async (ctx, next) => {
+  const text = ctx.message?.text?.trim();
   const st = transferState.get(ctx.from.id);
-  if (!st) return next();
+  if (!st) {
+    if (text && legacyReplyButtons.has(text)) {
+      await removeLegacyKeyboard(ctx);
+      await renderMainMenu(ctx, 'reply');
+      return;
+    }
+    if (await handleTokenTextMessage(ctx, text)) {
+      return;
+    }
+    return next();
+  }
 
   if (st.stage === 'to') {
     const to = ctx.message.text.trim();
