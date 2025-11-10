@@ -23,12 +23,54 @@ async function renderTokenSnapshot(
   mode: ViewMode = 'edit'
 ) {
   const keyboard = buildTokenKeyboard(snapshot.address, snapshot);
+  const keyboardPayload = keyboard as any;
+  const replyMarkup = keyboardPayload.reply_markup
+    ? { reply_markup: keyboardPayload.reply_markup }
+    : keyboardPayload;
+  const caption = buildTokenSummary(snapshot);
+  if (snapshot.chartImage) {
+    if (mode === 'reply') {
+      return ctx.replyWithPhoto(
+        { source: snapshot.chartImage, filename: 'chart.png' },
+        {
+          caption,
+          parse_mode: 'HTML',
+          ...keyboardPayload,
+        }
+      );
+    }
+    try {
+      return await ctx.editMessageMedia(
+        {
+          type: 'photo',
+          media: { source: snapshot.chartImage, filename: 'chart.png' },
+          caption,
+          parse_mode: 'HTML',
+        },
+        replyMarkup
+      );
+    } catch (err: any) {
+      const desc = String(err?.description || err?.message || '');
+      if (desc.includes('message is not modified')) return;
+      try {
+        await ctx.deleteMessage();
+      } catch {}
+      return ctx.replyWithPhoto(
+        { source: snapshot.chartImage, filename: 'chart.png' },
+        {
+          caption,
+          parse_mode: 'HTML',
+          ...keyboardPayload,
+        }
+      );
+    }
+  }
   const extra = {
-    ...(keyboard as any),
+    ...keyboardPayload,
     parse_mode: 'HTML',
     disable_web_page_preview: true,
   };
-  return sendView(ctx, buildTokenSummary(snapshot), extra, mode);
+  return sendView(ctx, caption, extra, mode);
 }
 
 async function showTokenByAddress(
