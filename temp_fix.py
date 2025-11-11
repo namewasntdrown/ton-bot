@@ -1,0 +1,1 @@
+from pathlib import Path\ntext = Path('services/bot/src/trading/service.ts').read_text(encoding='utf-8')\ntext = text.replace('\'??'', '?/?')\ntext = text.replace('\\u0414\\u0430', '??')\ntext = text.replace('\\u041d\\u0435\\u0442', '???')\ntext = text.replace('\\u043d/\\u0434', '?/?')\nPath('services/bot/src/trading/service.ts').write_text(text, encoding='utf-8')\n
