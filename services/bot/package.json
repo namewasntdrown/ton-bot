@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@ton/core": "^0.57.0",
     "axios": "^1.13.1",
     "dotenv": "^16.4.5",
     "telegraf": "^4.16.3",

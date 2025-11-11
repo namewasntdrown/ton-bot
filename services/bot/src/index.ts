@@ -7,6 +7,7 @@ import {
   handleTokenTextMessage,
   registerTradingActions,
   renderTradingMenu,
+  cancelTradingInput,
 } from './trading';
 
 const BOT_TOKEN = process.env.BOT_TOKEN!;
@@ -21,7 +22,54 @@ const TON_RPC =
   process.env.TON_RPC_ENDPOINT || 'https://toncenter.com/api/v2/jsonRPC';
 
 const bot = new Telegraf(BOT_TOKEN);
+const TELEGRAM_API_BASE = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const NANO_IN_TON = 1_000_000_000n;
+
+type TelegramApiParams = Record<string, string | number | boolean | undefined | null>;
+
+async function callTelegramBotApi(
+  method: string,
+  params?: TelegramApiParams,
+  label?: string,
+  timeout = 7000
+): Promise<boolean> {
+  const query =
+    params && Object.keys(params).length
+      ? Object.entries(params)
+          .filter(([, value]) => value !== undefined && value !== null)
+          .map(
+            ([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`
+          )
+          .join('&')
+      : '';
+  const url = `${TELEGRAM_API_BASE}/${method}${query ? `?${query}` : ''}`;
+  try {
+    await axios.get(url, { timeout });
+    if (label) console.log(`[telegram] ${label}: ok`);
+    return true;
+  } catch (e: any) {
+    console.warn(`[telegram] ${label || method} warn:`, e?.response?.data || e?.message);
+    return false;
+  }
+}
+
+function isGetUpdatesConflict(err: any): boolean {
+  const description =
+    err?.response?.data?.description || err?.description || err?.message || '';
+  return typeof description === 'string' && description.includes('terminated by other getUpdates request');
+}
+
+async function resetTelegramPollingSession() {
+  console.warn('[telegram] Detected another active getUpdates session. Trying to close it via Telegram API...');
+  const closed = await callTelegramBotApi('close', undefined, 'close');
+  if (!closed) {
+    throw new Error(
+      'Cannot close the previous Telegram polling session automatically. Stop other bot instances or wait a minute and try again.'
+    );
+  }
+  await delay(1000);
+}
 
 function toNanoBigInt(value: unknown): bigint {
   try {
@@ -178,16 +226,10 @@ const legacyReplyButtons = new Set([
 // ---------- утилиты ----------
 
 async function ensurePolling() {
+
   // снимаем webhook, если вдруг включён — иначе будет 409: Conflict
-  try {
-    await axios.get(
-      `https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`,
-      { timeout: 7000 }
-    );
-    console.log('🔧 deleteWebhook: ok');
-  } catch (e: any) {
-    console.warn('deleteWebhook warn:', e?.response?.data || e?.message);
-  }
+  await callTelegramBotApi('deleteWebhook', { drop_pending_updates: true }, 'deleteWebhook');
+
 }
 
 async function pingWalletApi(): Promise<boolean> {
@@ -398,7 +440,10 @@ bot.action(/^w_send_(\d+)$/, async (ctx) => {
 });
 
 bot.command('cancel', async (ctx) => {
-  transferState.delete(ctx.from.id);
+  if (ctx.from?.id) {
+    transferState.delete(ctx.from.id);
+    await cancelTradingInput(ctx.from.id, ctx.telegram);
+  }
   await ctx.reply('Отменено.');
 });
 
@@ -506,12 +551,41 @@ bot.telegram.setMyCommands([
   { command: 'help', description: 'Помощь' },
 ]);
 
+async function startBotWithSingleInstanceGuard() {
+  await ensurePolling();
+  try {
+    await bot.launch();
+    console.log('Bot started (polling)');
+    return;
+  } catch (err: any) {
+    if (!isGetUpdatesConflict(err)) {
+      throw err;
+    }
+    console.warn('Telegram returned 409 (another getUpdates session). Retrying after calling close()...');
+  }
+
+  await resetTelegramPollingSession();
+  await ensurePolling();
+  try {
+    await bot.launch();
+    console.log('Bot started after resetting polling session');
+  } catch (retryErr: any) {
+    if (isGetUpdatesConflict(retryErr)) {
+      throw new Error('Telegram rejected polling because another bot instance is still running. Stop the other process or use a different BOT_TOKEN.');
+    }
+    throw retryErr;
+  }
+}
+
 // ---------- запуск ----------
 
 (async () => {
-  await ensurePolling();
-  await bot.launch();
-  console.log('🤖 Bot started (polling)');
+  try {
+    await startBotWithSingleInstanceGuard();
+  } catch (err: any) {
+    console.error('Bot failed to start:', err?.response?.data || err?.message || err);
+    process.exit(1);
+  }
 })();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));

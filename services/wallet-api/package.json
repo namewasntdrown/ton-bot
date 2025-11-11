@@ -5,9 +5,11 @@
     "dev": "ts-node-dev --respawn --transpile-only src/main.ts"
   },
   "dependencies": {
+    "@dedust/sdk": "^0.8.7",
     "@fastify/cors": "^11.1.0",
     "@ton/crypto": "^3.3.0",
     "@ton/ton": "^16.0.0",
+    "axios": "^1.13.2",
     "dotenv": "^16.4.5",
     "envalid": "^8.1.1",
     "fastify": "^5.6.1",

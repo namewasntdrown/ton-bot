@@ -1,12 +1,24 @@
 // services/wallet-api/src/main.ts
 import 'dotenv/config';
-import Fastify from 'fastify';
+import Fastify, { type FastifyBaseLogger } from 'fastify';
 import cors from '@fastify/cors';
 import { z } from 'zod';
-import { migrate, listWalletsByUser, countWalletsByUser, insertWallet, getWalletById, getWalletSecretById, listAllUserWallets } from './db';
+import {
+  migrate,
+  listWalletsByUser,
+  countWalletsByUser,
+  insertWallet,
+  getWalletById,
+  getWalletSecretById,
+  listAllUserWallets,
+  getTradingProfile,
+  upsertTradingProfile,
+  insertSwapOrder,
+} from './db';
 import { encryptMnemonic, decryptMnemonic } from './crypto';
 import { mnemonicNew, mnemonicToPrivateKey } from '@ton/crypto';
 import { WalletContractV4, Address, internal, toNano, beginCell, TonClient, SendMode } from '@ton/ton';
+import { SwapRelayer } from './relayer';
 
 // MASTER parsing with prefixes
 const raw = process.env.MASTER_KEY_DEV || '';
@@ -26,6 +38,17 @@ const PORT = Number(process.env.PORT || 8090);
 // Default to mainnet unless overridden by env
 const TON_RPC = process.env.TON_RPC_ENDPOINT || 'https://toncenter.com/api/v2/jsonRPC';
 const TON_API_KEY = process.env.TONCENTER_API_KEY || undefined;
+
+function nanoToTonString(n: bigint) {
+  const s = n.toString();
+  if (s.length <= 9) {
+    const frac = s.padStart(9, '0');
+    return ('0.' + frac).replace(/\.0+$/, '').replace(/\.$/, '');
+  }
+  const int = s.slice(0, -9);
+  const frac = s.slice(-9).replace(/0+$/, '');
+  return frac ? `${int}.${frac}` : int;
+}
 
 async function deriveTonAddress(wordsArr: string[]) {
   const { publicKey } = await mnemonicToPrivateKey(wordsArr);
@@ -58,6 +81,49 @@ function asBooleanFlag(value: unknown) {
 async function bootstrap() {
   const app = Fastify({ logger: true });
   await app.register(cors, { origin: true });
+  const hydrateBalances = async (
+    rows: { id: number; address: string }[]
+  ): Promise<
+    Array<
+      {
+        id: number;
+        address: string;
+        balance_nton?: string | null;
+        balance_ton?: string | null;
+      } & Record<string, any>
+    >
+  > => {
+    if (!rows.length) return rows as any;
+    const client = new (TonClient as any)({ endpoint: TON_RPC, apiKey: TON_API_KEY });
+    return Promise.all(
+      rows.map(async (row) => {
+        try {
+          const balance = await client.getBalance(Address.parse(row.address));
+          return {
+            ...row,
+            balance_nton: balance.toString(),
+            balance_ton: nanoToTonString(balance),
+          };
+        } catch (err: any) {
+          app.log.warn(
+            { msg: err?.message, walletId: row.id, address: row.address },
+            'wallet_balance_fetch_failed'
+          );
+          return { ...row, balance_nton: null, balance_ton: null };
+        }
+      })
+    );
+  };
+  const relayer =
+    MASTER && MASTER.length === 32
+      ? new SwapRelayer({
+          masterKey: MASTER,
+          tonEndpoint: TON_RPC,
+          tonApiKey: TON_API_KEY,
+          dedustApiUrl: process.env.DEDUST_API_BASE_URL,
+          logger: app.log,
+        })
+      : null;
 
   app.get('/health', async () => ({ ok: true }));
 
@@ -66,12 +132,41 @@ async function bootstrap() {
 
   app.addHook('onReady', async () => {
     await migrate();
-    if (!MASTER || MASTER.length !== 32) app.log.warn('MASTER_KEY_DEV missing or invalid length (need 32 bytes).');
+    if (!MASTER || MASTER.length !== 32) {
+      app.log.warn('MASTER_KEY_DEV missing or invalid length (need 32 bytes).');
+    }
+    if (relayer) {
+      relayer.start();
+    }
+  });
+
+  app.addHook('onClose', async () => {
+    if (relayer) {
+      await relayer.stop();
+    }
   });
 
   // GET /wallets?user_id=...
   const QueryUserId = z.object({ user_id: z.coerce.number().int().nonnegative() });
   const CreateWalletDto = z.object({ user_id: z.coerce.number().int().nonnegative() });
+  const TradingProfileDto = z.object({
+    user_id: z.coerce.number().int().nonnegative(),
+    active_wallet_id: z.coerce.number().int().positive().optional(),
+    ton_amount: z.coerce.number().positive().optional(),
+    buy_limit_price: z.coerce.number().positive().optional(),
+    sell_percent: z.coerce.number().positive().optional(),
+    trade_mode: z.enum(['buy', 'sell']).optional(),
+    last_token: z.string().trim().optional(),
+  });
+  const SwapRequestDto = z.object({
+    user_id: z.coerce.number().int().nonnegative(),
+    wallet_id: z.coerce.number().int().positive(),
+    token_address: z.string().min(10),
+    direction: z.enum(['buy', 'sell']),
+    ton_amount: z.coerce.number().positive(),
+    limit_price: z.coerce.number().positive().optional(),
+    sell_percent: z.coerce.number().positive().optional(),
+  });
 
   app.get('/wallets', async (req, reply) => {
     try {
@@ -85,30 +180,79 @@ async function bootstrap() {
         return reply.send(rows);
       }
 
-      const client = new (TonClient as any)({ endpoint: TON_RPC, apiKey: TON_API_KEY });
-      const enriched = await Promise.all(
-        rows.map(async (row) => {
-          try {
-            const balance = await client.getBalance(Address.parse(row.address));
-            return {
-              ...row,
-              balance_nton: balance.toString(),
-              balance_ton: nanoToTonString(balance),
-            };
-          } catch (err: any) {
-            app.log.warn(
-              { msg: err?.message, userId, walletId: row.id, address: row.address },
-              'wallet_balance_fetch_failed'
-            );
-            return { ...row, balance_nton: null, balance_ton: null };
-          }
-        })
-      );
+      const enriched = await hydrateBalances(rows);
 
       return reply.send(enriched);
     } catch (err: any) {
       if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
       app.log.error({ msg: err?.message, stack: err?.stack }, 'GET /wallets error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
+  app.get('/trading/profile', async (req, reply) => {
+    try {
+      const { user_id } = QueryUserId.parse((req.query ?? {}) as any);
+      const [profile, walletsRaw] = await Promise.all([
+        getTradingProfile(user_id),
+        listWalletsByUser(user_id),
+      ]);
+      const wallets = await hydrateBalances(walletsRaw);
+      return reply.send({ profile, wallets });
+    } catch (err: any) {
+      if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'GET /trading/profile error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
+  app.post('/trading/profile', async (req, reply) => {
+    try {
+      const payload = TradingProfileDto.parse((req.body ?? {}) as any);
+      if (payload.active_wallet_id) {
+        const walletRow = await getWalletById(payload.active_wallet_id);
+        if (!walletRow || walletRow.user_id !== payload.user_id) {
+          return reply.code(404).send({ error: 'wallet_not_found' });
+        }
+      }
+      const updated = await upsertTradingProfile({
+        user_id: payload.user_id,
+        active_wallet_id: payload.active_wallet_id ?? null,
+        ton_amount: payload.ton_amount ?? null,
+        buy_limit_price: payload.buy_limit_price ?? null,
+        sell_percent: payload.sell_percent ?? null,
+        trade_mode: payload.trade_mode ?? null,
+        last_token: payload.last_token ?? null,
+      });
+      return reply.send(updated);
+    } catch (err: any) {
+      if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'POST /trading/profile error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
+  app.post('/swap', async (req, reply) => {
+    try {
+      const payload = SwapRequestDto.parse((req.body ?? {}) as any);
+      const walletRow = await getWalletById(payload.wallet_id);
+      if (!walletRow || walletRow.user_id !== payload.user_id) {
+        return reply.code(404).send({ error: 'wallet_not_found' });
+      }
+      const order = await insertSwapOrder({
+        user_id: payload.user_id,
+        wallet_id: payload.wallet_id,
+        token_address: payload.token_address,
+        direction: payload.direction,
+        ton_amount: payload.ton_amount,
+        limit_price: payload.limit_price ?? null,
+        sell_percent: payload.sell_percent ?? null,
+      });
+      // Placeholder: future integration will push BOC for relayer processing.
+      return reply.send({ order });
+    } catch (err: any) {
+      if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'POST /swap error');
       return reply.code(500).send({ error: 'internal' });
     }
   });
@@ -169,18 +313,6 @@ async function bootstrap() {
       return reply.code(500).send({ error: 'internal' });
     }
   });
-
-  // Helper to format nanoTON to human TON string without precision loss
-  function nanoToTonString(n: bigint) {
-    const s = n.toString();
-    if (s.length <= 9) {
-      const frac = s.padStart(9, '0');
-      return ('0.' + frac).replace(/\.0+$/,'').replace(/\.$/,'');
-    }
-    const int = s.slice(0, -9);
-    const frac = s.slice(-9).replace(/0+$/,'');
-    return frac ? `${int}.${frac}` : int;
-  }
 
   // GET /wallets/:id/max_sendable — estimates max TON user can send now (with fees)
   app.get('/wallets/:id/max_sendable', async (req, reply) => {
