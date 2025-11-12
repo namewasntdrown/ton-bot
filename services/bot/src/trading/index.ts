@@ -6,6 +6,7 @@ import {
   fetchTokenSnapshot,
   fetchTokenSearchResults,
   fetchTradingProfileContext,
+  fetchWalletJettonBalance,
   formatPercent,
   formatUsd,
   normalizeJettonAddress,
@@ -43,7 +44,7 @@ const addressToCallbackId = new Map<string, string>();
 const walletMenuTargets = new Map<number, { chatId: number; messageId: number }>();
 let callbackSeq = 0;
 
-function ensureCallbackAddressId(address: string): string {
+export function ensureCallbackAddressId(address: string): string {
   let id = addressToCallbackId.get(address);
   if (id) return id;
   id = (callbackSeq++).toString(36);
@@ -52,7 +53,7 @@ function ensureCallbackAddressId(address: string): string {
   return id;
 }
 
-function resolveCallbackAddress(id: string): string | null {
+export function resolveCallbackAddress(id: string): string | null {
   if (!id) return null;
   if (/^(?:EQ|UQ)/.test(id)) return id;
   return callbackIdToAddress.get(id) || null;
@@ -83,9 +84,14 @@ function resolveActiveWallet(
   return wallets[0] || null;
 }
 
+type TradingCaptionExtras = {
+  sellJettonBalanceLabel?: string | null;
+};
+
 function extendCaptionWithTrading(
   caption: string,
-  context: TradingContext | null
+  context: TradingContext | null,
+  extras: TradingCaptionExtras = {}
 ): string {
   if (!context) return caption;
   const lines: string[] = [];
@@ -110,6 +116,9 @@ function extendCaptionWithTrading(
     } else {
       const percentLabel = formatInputNumber(profile.sell_percent);
       lines.push(`📉 Объём продажи: ${percentLabel ? `${percentLabel}%` : 'не выбран'}`);
+      if (extras.sellJettonBalanceLabel) {
+        lines.push(`💵 Баланс монеты: ${extras.sellJettonBalanceLabel}`);
+      }
     }
   }
   if (!lines.length) return caption;
@@ -241,6 +250,33 @@ async function renderTokenSnapshot(
       tradingContext = null;
     }
   }
+  const activeWallet = tradingContext
+    ? resolveActiveWallet(tradingContext.profile ?? null, tradingContext.wallets)
+    : null;
+  let sellJettonBalanceLabel: string | null = null;
+  if (
+    tradingContext?.profile?.trade_mode === 'sell' &&
+    activeWallet?.id &&
+    snapshot.address
+  ) {
+    try {
+      const balance = await fetchWalletJettonBalance(activeWallet.id, snapshot.address);
+      if (balance?.balance !== undefined && balance?.balance !== null) {
+        const safeSymbol = snapshot.symbol
+          ? snapshot.symbol.replace(/[<>&]/g, (char) =>
+              char === '<' ? '&lt;' : char === '>' ? '&gt;' : '&amp;'
+            )
+          : '';
+        const suffix = safeSymbol ? ` ${safeSymbol}` : '';
+        sellJettonBalanceLabel = `${balance.balance}${suffix}`;
+      }
+    } catch (err: any) {
+      console.warn(
+        'jetton balance fetch failed:',
+        err?.response?.data || err?.message || err
+      );
+    }
+  }
   const callbackId = ensureCallbackAddressId(snapshot.address);
   const keyboard = buildTokenKeyboard(snapshot.address, snapshot, tradingContext || undefined, {
     callbackId,
@@ -249,7 +285,11 @@ async function renderTokenSnapshot(
   const replyMarkup = keyboardPayload.reply_markup
     ? { reply_markup: keyboardPayload.reply_markup }
     : keyboardPayload;
-  const caption = extendCaptionWithTrading(buildTokenSummary(snapshot), tradingContext || null);
+  const caption = extendCaptionWithTrading(
+    buildTokenSummary(snapshot),
+    tradingContext || null,
+    { sellJettonBalanceLabel }
+  );
   const target = options?.targetMessage || null;
 
   if (snapshot.chartImage) {
@@ -329,7 +369,7 @@ async function renderTokenSnapshot(
   return sendView(ctx, caption, extra, mode);
 }
 
-async function showTokenByAddress(
+export async function showTokenByAddress(
   ctx: any,
   address: string,
   mode: ViewMode = 'reply',
@@ -346,12 +386,17 @@ async function showTokenByAddress(
   return renderTokenSnapshot(ctx, snapshot, mode);
 }
 
+type TradingMenuOptions = {
+  forceInstructions?: boolean;
+};
+
 export async function renderTradingMenu(
   ctx: any,
-  mode: ViewMode = 'edit'
+  mode: ViewMode = 'edit',
+  options?: TradingMenuOptions
 ): Promise<void> {
   const userId = ctx.from?.id;
-  if (userId) {
+  if (!options?.forceInstructions && userId) {
     const lastAddress = userLastToken.get(userId);
     if (lastAddress) {
       try {
@@ -513,6 +558,14 @@ export function registerTradingActions(bot: Telegraf<any>) {
     try {
       await ctx.deleteMessage();
     } catch {}
+    if (ctx.from?.id) {
+      userLastToken.delete(ctx.from.id);
+    }
+    try {
+      await renderTradingMenu(ctx, 'reply', { forceInstructions: true });
+    } catch (err) {
+      console.error('render trading menu after hide failed', err);
+    }
   });
 
   bot.action(/^trade_mode:([^:]+):(buy|sell)$/, async (ctx) => {
@@ -787,6 +840,15 @@ export function registerTradingActions(bot: Telegraf<any>) {
         await ctx.reply('Укажи процент продажи (% кнопки или «Свой %»).');
         return;
       }
+      let snapshot: TokenSnapshot | null =
+        tokenSnapshotCache.get(address) || null;
+      if (!snapshot) {
+        try {
+          snapshot = await fetchTokenSnapshot(address);
+        } catch {
+          snapshot = null;
+        }
+      }
       const payload: SwapOrderRequest = {
         user_id: ctx.from.id,
         wallet_id: wallet.id,
@@ -799,6 +861,21 @@ export function registerTradingActions(bot: Telegraf<any>) {
       }
       if (profile.sell_percent && profile.sell_percent > 0) {
         payload.sell_percent = profile.sell_percent;
+      }
+      if (
+        direction === 'buy' &&
+        snapshot?.priceTon &&
+        snapshot.priceTon > 0
+      ) {
+        const tokenAmountEstimate = tonAmount / snapshot.priceTon;
+        payload.position_hint = {
+          token_amount: tokenAmountEstimate,
+          token_price_ton: snapshot.priceTon,
+          token_price_usd: snapshot.priceUsd,
+          token_symbol: snapshot.symbol ?? undefined,
+          token_name: snapshot.name ?? undefined,
+          token_image: snapshot.image ?? undefined,
+        };
       }
       const { order } = await submitSwapOrder(payload);
       await ctx.answerCbQuery('Заявка отправлена');

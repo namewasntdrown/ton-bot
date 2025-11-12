@@ -23,6 +23,7 @@ export type TokenSnapshot = {
   priceChange1hPct?: number;
   priceChange6hPct?: number;
   priceChange24hPct?: number;
+  holders?: number | null;
   links: ExternalLink[];
   chartImage?: Buffer;
   source?: 'ston' | 'dedust';
@@ -105,6 +106,54 @@ type DedustTickerCache = {
   fetchedAt: number;
 };
 
+type DedustCoinResponse = {
+  items: DedustCoin[];
+  total_count: number;
+};
+
+type DedustCoin = {
+  asset: string;
+  liquidity?: string;
+  market_cap?: string;
+  fully_diluted_market_cap?: string;
+  holders?: number;
+  metadata: {
+    name?: string;
+    ticker?: string;
+    image_url?: string;
+    decimals?: number;
+    description?: string;
+    usd_price?: string;
+    social_links?: Array<{ url?: string } | string> | string;
+  };
+  price?: {
+    usd_value?: string;
+    usd_change?: {
+      h1?: number;
+      h6?: number;
+      h24?: number;
+      d7?: number;
+    };
+    ton_value?: string;
+  };
+  volume?: {
+    periods?: {
+      h1?: string;
+      h6?: string;
+      h24?: string;
+      d7?: string;
+    };
+  };
+  transactions?: {
+    total?: {
+      h1?: number;
+      h6?: number;
+      h24?: number;
+      d7?: number;
+    };
+  };
+};
+
 type CachedMetadata = { data: DedustMetadata; fetchedAt: number };
 type JettonOnchainData = {
   totalSupply?: bigint;
@@ -127,6 +176,30 @@ export type WalletSummary = {
   balance?: string | null;
   balanceNton?: string | null;
 };
+export type WalletJettonBalance = {
+  wallet_id: number;
+  wallet_address: string;
+  token_address: string;
+  jetton_wallet_address?: string;
+  balance_raw: string;
+  balance: string;
+  decimals: number;
+};
+export type UserPositionSummary = {
+  id: number;
+  user_id: number;
+  wallet_id: number;
+  wallet_address: string;
+  token_address: string;
+  token_symbol?: string | null;
+  token_name?: string | null;
+  token_image?: string | null;
+  amount: string;
+  invested_ton: string;
+  is_hidden?: boolean;
+  created_at: string;
+  updated_at: string;
+};
 export type TradingContext = {
   profile: TradingProfile | null;
   wallets: WalletSummary[];
@@ -140,6 +213,12 @@ const DEDUST_API_BASE_URL =
 const DEDUST_TON_ADDRESS =
   process.env.DEDUST_TON_ADDRESS ||
   'EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c';
+const DEDUST_COINS_API_BASE_URL =
+  process.env.DEDUST_COINS_API_BASE_URL || 'https://dedust.io/v1/api';
+const DEDUST_COINS_HEADERS = {
+  Accept: 'application/json',
+  'User-Agent': 'ton-bot/coins-fetcher',
+};
 const TON_ADDRESS_RE = /^(?:EQ|UQ)[A-Za-z0-9_-]{46}$/;
 const TON_ADDRESS_SEARCH_RE = /(?:EQ|UQ)[A-Za-z0-9_-]{46}/;
 const MAX_INLINE_RESULTS = 120;
@@ -161,6 +240,11 @@ const dedustAssetCache: DedustAssetCache = {
 };
 const dedustTickerCache: DedustTickerCache = { list: [], fetchedAt: 0 };
 const dedustMetadataCache = new Map<string, CachedMetadata>();
+const walletJettonBalanceCache = new Map<
+  string,
+  { value: WalletJettonBalance; fetchedAt: number }
+>();
+const WALLET_JETTON_CACHE_TTL = 15_000;
 const compactNumberFormatter = new Intl.NumberFormat('en-US', {
   notation: 'compact',
   maximumFractionDigits: 2,
@@ -192,6 +276,14 @@ function getRawAddress(address: string): string | null {
   } catch {
     return null;
   }
+}
+
+function toJettonAssetKey(address: string): string | null {
+  if (!address) return null;
+  if (address === DEDUST_TON_ADDRESS) return 'native';
+  const raw = getRawAddress(address);
+  if (!raw) return null;
+  return `jetton:${raw}`;
 }
 
 function numberFrom(...values: any[]): number | undefined {
@@ -290,6 +382,17 @@ function formatTonValue(value?: number): string {
   return value.toFixed(6);
 }
 
+function formatUsdPrice(value?: number): string {
+  if (value === undefined) return 'н/д';
+  if (Math.abs(value) >= 1) {
+    return `$${value.toLocaleString('ru-RU', { maximumFractionDigits: 4 })}`;
+  }
+  if (Math.abs(value) >= 0.01) {
+    return `$${value.toFixed(4)}`;
+  }
+  return `$${value.toFixed(6)}`;
+}
+
 export function formatPercent(value?: number): string {
   if (value === undefined || Number.isNaN(value)) return 'н/д';
   const sign = value > 0 ? '+' : '';
@@ -300,6 +403,11 @@ function formatBooleanText(value: boolean | null | undefined): string {
   if (value === true) return 'Да';
   if (value === false) return 'Нет';
   return 'н/д';
+}
+
+function formatCount(value?: number | null): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return 'н/д';
+  return Number(value).toLocaleString('ru-RU');
 }
 
 function toNumber(value: unknown): number | null {
@@ -344,6 +452,50 @@ export async function fetchTradingProfileContext(
   return { profile, wallets };
 }
 
+export async function fetchWalletJettonBalance(
+  walletId: number,
+  tokenAddress: string
+): Promise<WalletJettonBalance> {
+  const encoded = encodeURIComponent(tokenAddress);
+  const cacheKey = `${walletId}:${tokenAddress}`;
+  const cached = walletJettonBalanceCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < WALLET_JETTON_CACHE_TTL) {
+    return cached.value;
+  }
+  const { data } = await axios.get(
+    `${WALLET_API}/wallets/${walletId}/jettons/${encoded}/balance`,
+    { timeout: 15_000 }
+  );
+  const value = data as WalletJettonBalance;
+  walletJettonBalanceCache.set(cacheKey, { value, fetchedAt: Date.now() });
+  return value;
+}
+
+export async function fetchUserPositions(
+  userId: number,
+  options: { includeHidden?: boolean } = {}
+): Promise<UserPositionSummary[]> {
+  const { includeHidden = false } = options;
+  const { data } = await axios.get(`${WALLET_API}/positions`, {
+    params: { user_id: userId, include_hidden: includeHidden ? 1 : 0 },
+    timeout: 10_000,
+  });
+  return Array.isArray(data) ? data : [];
+}
+
+export async function setUserPositionHidden(
+  userId: number,
+  positionId: number,
+  hidden: boolean
+): Promise<UserPositionSummary> {
+  const { data } = await axios.post(
+    `${WALLET_API}/positions/${positionId}/hide`,
+    { user_id: userId, hidden },
+    { timeout: 10_000 }
+  );
+  return data as UserPositionSummary;
+}
+
 export async function updateTradingProfile(
   userId: number,
   patch: Partial<TradingProfile>
@@ -375,6 +527,14 @@ export type SwapOrderRequest = {
   ton_amount: number;
   limit_price?: number | null;
   sell_percent?: number | null;
+  position_hint?: {
+    token_amount?: number;
+    token_price_ton?: number;
+    token_price_usd?: number;
+    token_symbol?: string;
+    token_name?: string;
+    token_image?: string;
+  } | null;
 };
 
 export async function submitSwapOrder(
@@ -731,13 +891,104 @@ function dedupeTokens(
   return Array.from(map.values());
 }
 
-async function getPopularTokenSearchResults(): Promise<TokenSearchItem[]> {
-  if (
-    popularTokenCache.tokens.length &&
-    Date.now() - popularTokenCache.fetchedAt < POPULAR_TOKEN_CACHE_TTL
-  ) {
-    return popularTokenCache.tokens;
+function dedustCoinAssetToAddress(asset: string): string | null {
+  if (!asset) return null;
+  if (asset === 'native') return DEDUST_TON_ADDRESS;
+  const parts = asset.split(':');
+  if (parts.length < 3) return null;
+  const workchain = parts[1];
+  const hash = parts.slice(2).join(':');
+  const raw = `${workchain}:${hash}`;
+  try {
+    const parsed = Address.parseRaw(raw);
+    return parsed.toString({ bounceable: true, urlSafe: true });
+  } catch {
+    return null;
   }
+}
+
+function buildTokenSearchItemFromCoin(coin: DedustCoin): TokenSearchItem | null {
+  const address = dedustCoinAssetToAddress(coin.asset);
+  if (!address) return null;
+  const metadata = coin.metadata || {};
+  const liquidityUsd = numberFrom(coin.liquidity);
+  const fdvUsd = numberFrom(
+    coin.fully_diluted_market_cap ?? coin.market_cap ?? undefined
+  );
+  const volume24hUsd = numberFrom(coin.volume?.periods?.h24 ?? undefined);
+  const priceChange24hPct = numberFrom(coin.price?.usd_change?.h24 ?? undefined);
+  return {
+    address,
+    name: metadata.name || metadata.ticker || address.slice(0, 6),
+    symbol: metadata.ticker,
+    image: metadata.image_url,
+    fdvUsd,
+    liquidityUsd,
+    volume24hUsd,
+    priceChange24hPct,
+  };
+}
+
+async function fetchDedustCoinsTop(
+  limit: number
+): Promise<TokenSearchItem[] | null> {
+  try {
+    const perPage = Math.min(Math.max(limit, 1), 200);
+    const { data } = await axios.get<DedustCoinResponse>(
+      `${DEDUST_COINS_API_BASE_URL}/coins`,
+      {
+        params: {
+          page: 1,
+          perPage,
+          sort_by: 'market_cap',
+          sort_direction: 'desc',
+          sort_period: '24h',
+          compact: false,
+        },
+        timeout: 15_000,
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'ton-bot/coins-fetcher',
+        },
+      }
+    );
+    const items = Array.isArray(data?.items) ? data.items : [];
+    const tokens = items
+      .map((coin) => buildTokenSearchItemFromCoin(coin))
+      .filter((token): token is TokenSearchItem => Boolean(token));
+    if (tokens.length) return tokens.slice(0, limit);
+  } catch (err: any) {
+    console.warn('dedust coins fetch failed:', err?.message || err);
+  }
+  return null;
+}
+
+async function fetchDedustCoinDetails(address: string): Promise<DedustCoin | null> {
+  const assetKey = toJettonAssetKey(address);
+  if (!assetKey) return null;
+  try {
+    const { data } = await axios.get<DedustCoinResponse>(
+      `${DEDUST_COINS_API_BASE_URL}/coins`,
+      {
+        params: {
+          page: 1,
+          perPage: 1,
+          filter_by_assets: assetKey,
+          compact: false,
+        },
+        timeout: 15_000,
+        headers: DEDUST_COINS_HEADERS,
+      }
+    );
+    const items = Array.isArray(data?.items) ? data.items : [];
+    return items[0] || null;
+  } catch (err: any) {
+    console.warn('dedust coin detail fetch failed:', err?.message || err);
+    return null;
+  }
+}
+
+async function buildPopularTokensFromTickers(): Promise<TokenSearchItem[]> {
   const [{ map }, tickers, tonPriceUsd] = await Promise.all([
     loadDedustAssets(),
     fetchDedustTickers(),
@@ -777,11 +1028,28 @@ async function getPopularTokenSearchResults(): Promise<TokenSearchItem[]> {
     seen.add(tokenAddress);
     if (tokens.length >= MAX_INLINE_RESULTS) break;
   }
+  return tokens;
+}
 
-  if (tokens.length) {
-    popularTokenCache.tokens = tokens;
+async function getPopularTokenSearchResults(): Promise<TokenSearchItem[]> {
+  if (
+    popularTokenCache.tokens.length &&
+    Date.now() - popularTokenCache.fetchedAt < POPULAR_TOKEN_CACHE_TTL
+  ) {
+    return popularTokenCache.tokens;
+  }
+  const coinsTokens = await fetchDedustCoinsTop(MAX_INLINE_RESULTS);
+  if (coinsTokens?.length) {
+    popularTokenCache.tokens = coinsTokens;
     popularTokenCache.fetchedAt = Date.now();
-    return tokens;
+    return coinsTokens;
+  }
+
+  const fallbackTokens = await buildPopularTokensFromTickers();
+  if (fallbackTokens.length) {
+    popularTokenCache.tokens = fallbackTokens;
+    popularTokenCache.fetchedAt = Date.now();
+    return fallbackTokens;
   }
 
   return popularTokenCache.tokens;
@@ -797,9 +1065,9 @@ function escapeHtml(str?: string): string {
 
 function relativeTime(ts: number): string {
   const diff = Date.now() - ts;
-  if (diff < 60_000) return 'Ð¼ÐµÐ½ÑŒÑˆÐµ Ð¼Ð¸Ð½ÑƒÑ‚Ñ‹ Ð½Ð°Ð·Ð°Ð´';
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} Ð¼Ð¸Ð½ Ð½Ð°Ð·Ð°Ð´`;
-  return `${Math.floor(diff / 3_600_000)} Ñ‡ Ð½Ð°Ð·Ð°Ð´`;
+  if (diff < 60_000) return 'менее минуты назад';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} мин назад`;
+  return `${Math.floor(diff / 3_600_000)} ч назад`;
 }
 
 export async function getTonPriceUsd(force = false): Promise<number | undefined> {
@@ -891,29 +1159,44 @@ function buildExternalLinks(
 async function fetchDedustTokenSnapshot(
   address: string
 ): Promise<TokenSnapshot | null> {
-  const [{ map }, tickers, tonPriceUsd, metadata, jettonData] = await Promise.all([
-    loadDedustAssets(),
-    fetchDedustTickers(),
-    getTonPriceUsd(),
-    fetchDedustMetadata(address).catch(() => null),
-    fetchJettonOnchainData(address).catch(() => null),
-  ]);
+  const [{ map }, tickers, tonPriceUsd, metadata, jettonData, coinData] =
+    await Promise.all([
+      loadDedustAssets(),
+      fetchDedustTickers(),
+      getTonPriceUsd(),
+      fetchDedustMetadata(address).catch(() => null),
+      fetchJettonOnchainData(address).catch(() => null),
+      fetchDedustCoinDetails(address).catch(() => null),
+    ]);
 
   const asset = map.get(address);
   const ticker = selectDedustTicker(address, tickers);
   if (!ticker) return null;
 
-  const priceTon = computePriceTonFromTicker(ticker, address);
-  const priceUsd = priceTon && tonPriceUsd ? priceTon * tonPriceUsd : undefined;
-  const decimals = Number(metadata?.decimals ?? asset?.decimals ?? 9) || 9;
+  const priceTonCoin = numberFrom(coinData?.price?.ton_value);
+  const priceTonTicker = computePriceTonFromTicker(ticker, address);
+  const priceTon = priceTonCoin ?? priceTonTicker;
+  const priceUsdCoin = numberFrom(
+    coinData?.metadata?.usd_price,
+    coinData?.price?.usd_value
+  );
+  const priceUsd =
+    priceUsdCoin ??
+    (priceTon !== undefined && tonPriceUsd ? priceTon * tonPriceUsd : undefined);
+  const decimals =
+    Number(metadata?.decimals ?? asset?.decimals ?? coinData?.metadata?.decimals ?? 9) ||
+    9;
   const supplyTokens =
     jettonData?.totalSupply !== undefined
       ? Number(jettonData.totalSupply) / Math.pow(10, decimals)
       : undefined;
-  const fdvUsd =
+  const fdvUsd = numberFrom(
+    coinData?.fully_diluted_market_cap,
+    coinData?.market_cap,
     supplyTokens !== undefined && priceUsd !== undefined
       ? supplyTokens * priceUsd
-      : undefined;
+      : undefined
+  );
   const ownershipRenounced =
     jettonData?.adminAddress === null
       ? true
@@ -921,30 +1204,44 @@ async function fetchDedustTokenSnapshot(
       ? false
       : null;
   const trades = await fetchDedustTrades(ticker.pool_id);
-  const links = buildExternalLinks(address, metadata, undefined);
+  const links = buildExternalLinks(address, metadata, coinData?.metadata);
+  const txns24h = numberFrom(
+    coinData?.transactions?.total?.h24,
+    countTradesWithinHours(trades, 24)
+  );
+  const txns1h = numberFrom(
+    coinData?.transactions?.total?.h1,
+    countTradesWithinHours(trades, 1)
+  );
 
   return {
     address,
     name:
       metadata?.name ||
       asset?.name ||
+      coinData?.metadata?.name ||
       metadata?.symbol ||
       asset?.symbol ||
+      coinData?.metadata?.ticker ||
       'Token',
-    symbol: metadata?.symbol || asset?.symbol,
-    description: metadata?.description || '',
-    image: metadata?.image || asset?.image,
+    symbol: metadata?.symbol || asset?.symbol || coinData?.metadata?.ticker,
+    description: metadata?.description || coinData?.metadata?.description || '',
+    image: metadata?.image || coinData?.metadata?.image_url || asset?.image,
     priceUsd,
     priceTon,
     tonPriceUsd,
     fdvUsd,
-    liquidityUsd: numberFrom(ticker.liquidity_in_usd),
-    volume24hUsd: computeVolumeUsdFromTicker(ticker, tonPriceUsd, priceTon),
-    txns24h: countTradesWithinHours(trades, 24),
-    txns1h: countTradesWithinHours(trades, 1),
+    liquidityUsd: numberFrom(coinData?.liquidity, ticker.liquidity_in_usd),
+    volume24hUsd: numberFrom(
+      coinData?.volume?.periods?.h24,
+      computeVolumeUsdFromTicker(ticker, tonPriceUsd, priceTonTicker)
+    ),
+    txns24h,
+    txns1h,
     priceChange1hPct: undefined,
     priceChange6hPct: undefined,
-    priceChange24hPct: undefined,
+    priceChange24hPct: numberFrom(coinData?.price?.usd_change?.h24),
+    holders: coinData?.holders ?? null,
     links,
     chartImage: undefined,
     source: 'dedust',
@@ -979,53 +1276,53 @@ export async function fetchTokenSnapshot(
 export function buildTokenSummary(snapshot: TokenSnapshot): string {
   const lines: string[] = [];
   const tokenLabel =
-    snapshot.symbol && snapshot.name
+    snapshot.symbol && snapshot.name && snapshot.symbol !== snapshot.name
       ? `${snapshot.symbol} (${snapshot.name})`
-      : snapshot.symbol || snapshot.name || '\u0422\u043E\u043A\u0435\u043D';
-  lines.push(`<b>${escapeHtml(tokenLabel)}</b>`);
+      : snapshot.symbol || snapshot.name || 'Токен';
+  lines.push(`⭐ <b>${escapeHtml(tokenLabel)}</b>`);
 
-  const tonPriceText = snapshot.priceTon
-    ? `${formatTonValue(snapshot.priceTon)} TON`
-    : '\u2014';
-  const usdPriceText = snapshot.priceUsd
-    ? `$${snapshot.priceUsd.toFixed(4)}`
-    : null;
   lines.push(
-    `\u{1FA99} <b>\u0426\u0435\u043D\u0430:</b> ${tonPriceText}${
-      usdPriceText ? ` (${usdPriceText})` : ''
-    }`
+    `💰 <b>Цена:</b> ${formatTonValue(snapshot.priceTon)} TON (${formatUsdPrice(
+      snapshot.priceUsd
+    )}) · 24ч: ${formatPercent(snapshot.priceChange24hPct)}`
   );
 
   lines.push(
-    `\u{1FA99} <b>FDV:</b> ${formatUsd(snapshot.fdvUsd)} \u2022 \u{1F4A7} <b>LP:</b> ${formatUsd(
+    `🏦 <b>FDV:</b> ${formatUsd(snapshot.fdvUsd)}  •  💧 <b>LP:</b> ${formatUsd(
       snapshot.liquidityUsd
     )}`
   );
   lines.push(
-    `\u{1F4C8} <b>VOL 24\u0447:</b> ${formatUsd(snapshot.volume24hUsd)} \u2022 <b>TXNS 24\u0447:</b> ${
-      snapshot.txns24h ?? '\u2014'
-    }`
+    `📊 <b>VOL 24ч:</b> ${formatUsd(snapshot.volume24hUsd)}  •  🔁 <b>TXNS 24ч:</b> ${formatCount(
+      snapshot.txns24h
+    )}`
   );
-  const lpLockText = formatBooleanText(snapshot.lpLocked);
-  const ownershipText = formatBooleanText(snapshot.ownershipRenounced);
-  lines.push(`\u{1F513} <b>LP \u041B\u043E\u043A:</b> ${lpLockText}`);
-  lines.push(`\u{1F451} <b>\u041E\u0442\u043A\u0430\u0437 \u043E\u0442 \u0432\u043B\u0430\u0434\u0435\u043D\u0438\u044F:</b> ${ownershipText}`);
+  if (snapshot.holders !== undefined && snapshot.holders !== null) {
+    lines.push(`👥 <b>Холдеры:</b> ${formatCount(snapshot.holders)}`);
+  }
+  lines.push(
+    `🔒 <b>LP Лок:</b> ${formatBooleanText(snapshot.lpLocked)}  •  👑 <b>Отказ:</b> ${formatBooleanText(
+      snapshot.ownershipRenounced
+    )}`
+  );
   lines.push('');
 
-  lines.push(`\u0410\u0434\u0440\u0435\u0441: <code>${snapshot.address}</code>`);
+  lines.push(`🔗 <b>Адрес:</b> <code>${snapshot.address}</code>`);
   if (snapshot.description) {
-    lines.push(`\u{1F4DD} ${escapeHtml(snapshot.description).slice(0, 320)}`);
+    lines.push(`📝 ${escapeHtml(snapshot.description).slice(0, 320)}`);
   }
   if (snapshot.links.length) {
     lines.push(
       snapshot.links
-        .map((link) => `\u2022 <a href=\"${link.url}\">${escapeHtml(link.title)}</a>`)
-        .join(' ')
+        .map((link) => `• <a href="${link.url}">${escapeHtml(link.title)}</a>`)
+        .join('  ')
     );
   }
-  lines.push(`\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u043E: ${relativeTime(snapshot.updatedAt)}`);
+  lines.push(`🕒 Обновлено: ${relativeTime(snapshot.updatedAt)}`);
   return lines.join('\n');
 }
+
+
 
 export function buildTokenKeyboard(
   address: string,
@@ -1054,12 +1351,6 @@ export function buildTokenKeyboard(
     : 'trade_wallet_create';
 
   const rows: ReturnType<typeof Markup.inlineKeyboard>['reply_markup']['inline_keyboard'] = [
-    [
-      Markup.button.callback('1м', 'noop'),
-      Markup.button.callback('5м', 'noop'),
-      Markup.button.callback('30м', 'noop'),
-      Markup.button.callback('1ч', 'noop'),
-    ],
     [
       Markup.button.callback('🔄 Обновить', `token_refresh:${callbackKey}`),
       Markup.button.callback('📤 Поделиться', `token_share:${callbackKey}`),

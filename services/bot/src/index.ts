@@ -8,7 +8,9 @@ import {
   registerTradingActions,
   renderTradingMenu,
   cancelTradingInput,
+  showTokenByAddress,
 } from './trading';
+import { renderPositionsMenu, registerPositionActions } from './features/positions';
 
 const BOT_TOKEN = process.env.BOT_TOKEN!;
 if (!BOT_TOKEN) {
@@ -290,12 +292,18 @@ bot.action('menu_wallets', async (ctx) => {
   await renderWalletsMenu(ctx);
 });
 
+bot.action('menu_positions', async (ctx) => {
+  await ctx.answerCbQuery();
+  await renderPositionsMenu(ctx);
+});
+
 bot.action('menu_transfer', async (ctx) => {
   await ctx.answerCbQuery();
   await renderTradingMenu(ctx);
 });
 
 registerTradingActions(bot);
+registerPositionActions(bot);
 
 const stubViews: Record<
   string,
@@ -546,10 +554,25 @@ bot.action(/^w_seed_show_(\d+)$/, async (ctx) => {
 });
 
 // Опционально — команды в меню клиента
-bot.telegram.setMyCommands([
-  { command: 'start', description: 'Запуск и получение кошелька' },
-  { command: 'help', description: 'Помощь' },
-]);
+async function configureBotMenu() {
+  const commands = [
+    { command: 'start', description: 'Запуск и получение кошелька' },
+    { command: 'menu', description: 'Показать главное меню' },
+    { command: 'help', description: 'Помощь' },
+  ];
+  try {
+    await bot.telegram.setMyCommands(commands);
+  } catch (err: any) {
+    console.warn('Failed to set bot commands:', err?.response?.data || err?.message || err);
+  }
+  try {
+    await bot.telegram.setChatMenuButton({
+      menuButton: { type: 'commands' },
+    });
+  } catch (err: any) {
+    console.warn('Failed to set chat menu button:', err?.response?.data || err?.message || err);
+  }
+}
 
 async function startBotWithSingleInstanceGuard() {
   await ensurePolling();
@@ -581,6 +604,7 @@ async function startBotWithSingleInstanceGuard() {
 
 (async () => {
   try {
+    await configureBotMenu();
     await startBotWithSingleInstanceGuard();
   } catch (err: any) {
     console.error('Bot failed to start:', err?.response?.data || err?.message || err);

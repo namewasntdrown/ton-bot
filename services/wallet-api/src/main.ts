@@ -14,11 +14,14 @@ import {
   getTradingProfile,
   upsertTradingProfile,
   insertSwapOrder,
+  upsertUserPosition,
 } from './db';
 import { encryptMnemonic, decryptMnemonic } from './crypto';
 import { mnemonicNew, mnemonicToPrivateKey } from '@ton/crypto';
 import { WalletContractV4, Address, internal, toNano, beginCell, TonClient, SendMode } from '@ton/ton';
 import { SwapRelayer } from './relayer';
+import { registerPositionRoutes } from './routes/positions';
+import { asBooleanFlag } from './utils/flags';
 
 // MASTER parsing with prefixes
 const raw = process.env.MASTER_KEY_DEV || '';
@@ -63,19 +66,6 @@ function addressVariants(addr: string) {
     bounceable: a.toString({ bounceable: true } as any),
     non_bounceable: a.toString({ bounceable: false } as any),
   };
-}
-
-function asBooleanFlag(value: unknown) {
-  if (typeof value === 'string') {
-    return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
-  }
-  if (typeof value === 'number') {
-    return value !== 0;
-  }
-  if (typeof value === 'boolean') {
-    return value;
-  }
-  return false;
 }
 
 async function bootstrap() {
@@ -139,6 +129,7 @@ async function bootstrap() {
       relayer.start();
     }
   });
+  registerPositionRoutes(app);
 
   app.addHook('onClose', async () => {
     if (relayer) {
@@ -158,6 +149,14 @@ async function bootstrap() {
     trade_mode: z.enum(['buy', 'sell']).optional(),
     last_token: z.string().trim().optional(),
   });
+  const PositionHintDto = z.object({
+    token_amount: z.coerce.number().positive(),
+    token_price_ton: z.coerce.number().positive().optional(),
+    token_price_usd: z.coerce.number().positive().optional(),
+    token_symbol: z.string().trim().max(64).optional(),
+    token_name: z.string().trim().max(128).optional(),
+    token_image: z.string().trim().max(512).optional(),
+  });
   const SwapRequestDto = z.object({
     user_id: z.coerce.number().int().nonnegative(),
     wallet_id: z.coerce.number().int().positive(),
@@ -166,6 +165,7 @@ async function bootstrap() {
     ton_amount: z.coerce.number().positive(),
     limit_price: z.coerce.number().positive().optional(),
     sell_percent: z.coerce.number().positive().optional(),
+    position_hint: PositionHintDto.optional(),
   });
 
   app.get('/wallets', async (req, reply) => {
@@ -248,6 +248,29 @@ async function bootstrap() {
         limit_price: payload.limit_price ?? null,
         sell_percent: payload.sell_percent ?? null,
       });
+      if (
+        payload.direction === 'buy' &&
+        payload.position_hint?.token_amount &&
+        payload.position_hint.token_amount > 0
+      ) {
+        try {
+          await upsertUserPosition({
+            user_id: payload.user_id,
+            wallet_id: payload.wallet_id,
+            token_address: payload.token_address,
+            token_symbol: payload.position_hint.token_symbol,
+            token_name: payload.position_hint.token_name,
+            token_image: payload.position_hint.token_image,
+            amount: payload.position_hint.token_amount,
+            invested_ton: payload.ton_amount,
+          });
+        } catch (err: any) {
+          app.log.error(
+            { msg: err?.message, payload },
+            'user_position_upsert_failed'
+          );
+        }
+      }
       // Placeholder: future integration will push BOC for relayer processing.
       return reply.send({ order });
     } catch (err: any) {

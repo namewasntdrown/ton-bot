@@ -94,6 +94,23 @@ export async function migrate() {
       ADD COLUMN IF NOT EXISTS error TEXT,
       ADD COLUMN IF NOT EXISTS tx_hash TEXT,
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+    CREATE TABLE IF NOT EXISTS user_positions (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL,
+      wallet_id BIGINT NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+      token_address TEXT NOT NULL,
+      token_symbol TEXT,
+      token_name TEXT,
+      token_image TEXT,
+      amount NUMERIC NOT NULL DEFAULT 0,
+      invested_ton NUMERIC NOT NULL DEFAULT 0,
+      is_hidden BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(user_id, wallet_id, token_address)
+    );
+    CREATE INDEX IF NOT EXISTS idx_positions_user ON user_positions(user_id);
   `);
 }
 
@@ -312,4 +329,95 @@ export async function claimNextSwapOrder(): Promise<SwapOrderRow | null> {
   } finally {
     client.release();
   }
+}
+
+export type UserPositionRow = {
+  id: number;
+  user_id: number;
+  wallet_id: number;
+  token_address: string;
+  token_symbol: string | null;
+  token_name: string | null;
+  token_image: string | null;
+  amount: string;
+  invested_ton: string;
+  is_hidden: boolean;
+  created_at: string;
+  updated_at: string;
+  wallet_address?: string;
+};
+
+export async function upsertUserPosition(row: {
+  user_id: number;
+  wallet_id: number;
+  token_address: string;
+  token_symbol?: string | null;
+  token_name?: string | null;
+  token_image?: string | null;
+  amount: number;
+  invested_ton: number;
+}): Promise<UserPositionRow> {
+  const {
+    user_id,
+    wallet_id,
+    token_address,
+    token_symbol = null,
+    token_name = null,
+    token_image = null,
+    amount,
+    invested_ton,
+  } = row;
+  const r = await pool.query<UserPositionRow>(
+    `INSERT INTO user_positions (user_id, wallet_id, token_address, token_symbol, token_name, token_image, amount, invested_ton)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (user_id, wallet_id, token_address)
+     DO UPDATE SET
+       amount = user_positions.amount + EXCLUDED.amount,
+       invested_ton = user_positions.invested_ton + EXCLUDED.invested_ton,
+       token_symbol = COALESCE(EXCLUDED.token_symbol, user_positions.token_symbol),
+       token_name = COALESCE(EXCLUDED.token_name, user_positions.token_name),
+       token_image = COALESCE(EXCLUDED.token_image, user_positions.token_image),
+       is_hidden = FALSE,
+       updated_at = NOW()
+     RETURNING id, user_id, wallet_id, token_address, token_symbol, token_name, token_image,
+               amount::text, invested_ton::text, is_hidden, created_at, updated_at`,
+    [user_id, wallet_id, token_address, token_symbol, token_name, token_image, amount, invested_ton]
+  );
+  return r.rows[0];
+}
+
+export async function listUserPositions(
+  userId: number,
+  options: { includeHidden?: boolean } = {}
+): Promise<UserPositionRow[]> {
+  const includeHidden = options.includeHidden ?? false;
+  const r = await pool.query<UserPositionRow>(
+    `SELECT p.id, p.user_id, p.wallet_id, p.token_address, p.token_symbol, p.token_name, p.token_image,
+            p.amount::text, p.invested_ton::text, p.is_hidden, p.created_at, p.updated_at,
+            w.address AS wallet_address
+       FROM user_positions p
+       JOIN wallets w ON w.id = p.wallet_id
+      WHERE p.user_id = $1
+        ${includeHidden ? '' : 'AND p.is_hidden = FALSE'}
+      ORDER BY p.updated_at DESC`,
+    [userId]
+  );
+  return r.rows;
+}
+
+export async function setUserPositionHidden(
+  userId: number,
+  positionId: number,
+  hidden: boolean
+): Promise<UserPositionRow | null> {
+  const r = await pool.query<UserPositionRow>(
+    `UPDATE user_positions
+        SET is_hidden = $3,
+            updated_at = NOW()
+      WHERE id = $1 AND user_id = $2
+      RETURNING id, user_id, wallet_id, token_address, token_symbol, token_name, token_image,
+                amount::text, invested_ton::text, is_hidden, created_at, updated_at`,
+    [positionId, userId, hidden]
+  );
+  return r.rows[0] || null;
 }
