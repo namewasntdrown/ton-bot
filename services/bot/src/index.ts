@@ -1,4 +1,4 @@
-// services/bot/src/index.ts
+﻿// services/bot/src/index.ts
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import axios from 'axios';
@@ -133,7 +133,7 @@ async function renderMainMenu(ctx: any, mode: ViewMode = 'edit') {
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🏆 Торговый конкурс', 'menu_competition')],
     [Markup.button.callback(walletsLabel, 'menu_wallets'), Markup.button.callback('💼 Позиции', 'menu_positions')],
-    [Markup.button.callback('🚀 Торговля', 'menu_transfer'), Markup.button.callback('🔎 Поиск токенов', 'menu_tokens')],
+    [Markup.button.callback('🚀 Торговля', 'menu_transfer')],
     [Markup.button.callback('🤖 Копи-трейдинг', 'menu_copytrade'), Markup.button.callback('🎯 Снайпы', 'menu_snipes')],
     [Markup.button.callback('🧱 Лимитки [BETA]', 'menu_limits'), Markup.button.callback('🤝 Рефералка', 'menu_ref')],
     [Markup.button.callback('🆘 Помощь', 'menu_help'), Markup.button.callback('⚙️ Настройки', 'menu_settings')],
@@ -215,7 +215,6 @@ const legacyReplyButtons = new Set([
   '💼 Позиции',
   '💸 Перевод',
   '🚀 Торговля',
-  '🔎 Поиск токенов',
   '🤖 Копи-трейдинг',
   '🎯 Снайпы',
   '🧱 Лимитки [BETA]',
@@ -313,14 +312,7 @@ const stubViews: Record<
     title: '🏆 Торговый конкурс',
     text: 'Скоро объявим детали конкурса и призы. Следи за новостями!'
   },
-  menu_positions: {
-    title: '💼 Позиции',
-    text: 'Мониторинг позиций появится чуть позже.'
-  },
-  menu_tokens: {
-    title: '🔎 Поиск токенов',
-    text: 'Мы работаем над удобным поиском и аналитикой токенов.'
-  },
+  
   menu_copytrade: {
     title: '🤖 Копи-трейдинг',
     text: 'Копитрейдинг: список трейдеров появится позже.'
