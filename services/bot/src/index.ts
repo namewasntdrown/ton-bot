@@ -1,4 +1,3 @@
-﻿// services/bot/src/index.ts
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import axios from 'axios';
@@ -8,20 +7,16 @@ import {
   registerTradingActions,
   renderTradingMenu,
   cancelTradingInput,
-  showTokenByAddress,
 } from './trading';
 import { renderPositionsMenu, registerPositionActions } from './features/positions';
 
-const BOT_TOKEN = process.env.BOT_TOKEN!;
+const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
-  console.error('❌ BOT_TOKEN не задан в .env (services/bot/.env)');
+  console.error('BOT_TOKEN отсутствует в services/bot/.env');
   process.exit(1);
 }
 
-// Лучше 127.0.0.1, чтобы исключить странности с localhost
-const WALLET_API = process.env.WALLET_API || 'http://127.0.0.1:8090';
-const TON_RPC =
-  process.env.TON_RPC_ENDPOINT || 'https://toncenter.com/api/v2/jsonRPC';
+const WALLET_API = process.env.WALLET_API ?? 'http://127.0.0.1:8090';
 
 const bot = new Telegraf(BOT_TOKEN);
 const TELEGRAM_API_BASE = `https://api.telegram.org/bot${BOT_TOKEN}`;
@@ -50,8 +45,8 @@ async function callTelegramBotApi(
     await axios.get(url, { timeout });
     if (label) console.log(`[telegram] ${label}: ok`);
     return true;
-  } catch (e: any) {
-    console.warn(`[telegram] ${label || method} warn:`, e?.response?.data || e?.message);
+  } catch (err: any) {
+    console.warn(`[telegram] ${label || method} warn:`, err?.response?.data || err?.message);
     return false;
   }
 }
@@ -63,7 +58,9 @@ function isGetUpdatesConflict(err: any): boolean {
 }
 
 async function resetTelegramPollingSession() {
-  console.warn('[telegram] Detected another active getUpdates session. Trying to close it via Telegram API...');
+  console.warn(
+    '[telegram] Detected another active getUpdates session. Trying to close it via Telegram API...'
+  );
   const closed = await callTelegramBotApi('close', undefined, 'close');
   if (!closed) {
     throw new Error(
@@ -116,7 +113,7 @@ async function fetchWalletsWithBalance(userId: number): Promise<WalletRecord[]> 
 
 async function renderMainMenu(ctx: any, mode: ViewMode = 'edit') {
   const userId = ctx.from?.id;
-  let walletsLabel = 'Кошельки 👛';
+  let walletsLabel = '💼 Кошельки';
   if (userId) {
     try {
       const wallets = await fetchWalletsWithBalance(userId);
@@ -124,23 +121,27 @@ async function renderMainMenu(ctx: any, mode: ViewMode = 'edit') {
         (sum, w) => sum + toNanoBigInt(w.balance_nton ?? w.balance ?? w.balanceNton ?? 0),
         0n
       );
-      walletsLabel = `Кошельки 👛 [ ${formatTonFromNano(total)} 💎 ]`;
+      walletsLabel = `💼 Кошельки [ ${formatTonFromNano(total)} TON ]`;
     } catch {
-      // ignore and keep default label
+      // keep fallback label
     }
   }
 
   const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback('🏆 Торговый конкурс', 'menu_competition')],
-    [Markup.button.callback(walletsLabel, 'menu_wallets'), Markup.button.callback('💼 Позиции', 'menu_positions')],
-    [Markup.button.callback('🚀 Торговля', 'menu_transfer')],
-    [Markup.button.callback('🤖 Копи-трейдинг', 'menu_copytrade'), Markup.button.callback('🎯 Снайпы', 'menu_snipes')],
-    [Markup.button.callback('🧱 Лимитки [BETA]', 'menu_limits'), Markup.button.callback('🤝 Рефералка', 'menu_ref')],
-    [Markup.button.callback('🆘 Помощь', 'menu_help'), Markup.button.callback('⚙️ Настройки', 'menu_settings')],
-    [Markup.button.callback('📚 Руководство', 'menu_guide')],
+    [Markup.button.callback('📈 Терминал', 'menu_competition')],
+    [Markup.button.callback(walletsLabel, 'menu_wallets'), Markup.button.callback('📊 Позиции', 'menu_positions')],
+    [Markup.button.callback('🔁 Перевод через TON', 'menu_transfer')],
+    [Markup.button.callback('🤝 Копитрейдинг', 'menu_copytrade'), Markup.button.callback('🎯 Снайперы', 'menu_snipes')],
+    [Markup.button.callback('📋 Лимитные ордера (beta)', 'menu_limits'), Markup.button.callback('🎁 Рефералка', 'menu_ref')],
+    [Markup.button.callback('📚 Помощь', 'menu_help'), Markup.button.callback('⚙️ Настройки', 'menu_settings')],
+    [Markup.button.callback('🧭 Гид по боту', 'menu_guide')],
   ]);
-  const text =
-    'Привет! Я помогу тебе торговать на TON быстрее всех 🚀\n\nВыбирай раздел ниже:';
+  const text = [
+    '👋 Привет! Это TON-бот для кошельков, торговли и автоматизаций.',
+    'Все основные разделы доступны через менюшку ниже.',
+    '',
+    'Выберите нужный пункт:',
+  ].join('\n');
   return sendView(ctx, text, keyboard, mode);
 }
 
@@ -149,8 +150,8 @@ async function renderWalletsMenu(ctx: any, mode: ViewMode = 'edit') {
   if (!userId) {
     return sendView(
       ctx,
-      'Не удалось определить пользователя.',
-      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Меню', 'menu_home')]]),
+      'Не удалось определить пользователя Telegram. Попробуйте перезапустить бота.',
+      Markup.inlineKeyboard([[Markup.button.callback('⬅️ В главное меню', 'menu_home')]]),
       mode
     );
   }
@@ -158,36 +159,40 @@ async function renderWalletsMenu(ctx: any, mode: ViewMode = 'edit') {
   try {
     const wallets = await fetchWalletsWithBalance(userId);
     if (!Array.isArray(wallets) || wallets.length === 0) {
-      const text = 'Кошельки 👛 [ 0 💎 ]\nУ тебя пока нет кошельков.';
+      const text = [
+        '💼 У вас пока нет кошельков.',
+        'Создайте первый кошелек, чтобы начать пользоваться TON-ботом.',
+      ].join('\n');
       const keyboard = Markup.inlineKeyboard([
-        [Markup.button.callback('🆕 Новый кошелёк', 'w_new')],
-        [Markup.button.callback('⬅️ Меню', 'menu_home')],
+        [Markup.button.callback('➕ Создать кошелек', 'w_new')],
+        [Markup.button.callback('⬅️ В главное меню', 'menu_home')],
       ]);
       return sendView(ctx, text, keyboard, mode);
     }
 
     let total = 0n;
-    const rows = wallets.map((w) => {
-      const balanceNano = toNanoBigInt(w.balance_nton ?? w.balance ?? w.balanceNton ?? 0);
+    const rows = wallets.map((wallet) => {
+      const balanceNano = toNanoBigInt(wallet.balance_nton ?? wallet.balance ?? wallet.balanceNton ?? 0);
       total += balanceNano;
-      const address = String(w.address || '');
-      const label = `${address.slice(-6) || address || '??????'} · 💎 ${formatTonFromNano(
-        balanceNano
-      )}`;
-      return [Markup.button.callback(label, `w_open_${w.id}`)];
+      const address = String(wallet.address || '');
+      const label = `${address.slice(-6) || address} · ${formatTonFromNano(balanceNano)} TON`;
+      return [Markup.button.callback(label, `w_open_${wallet.id}`)];
     });
-    rows.push([Markup.button.callback('🆕 Новый кошелёк', 'w_new')]);
-    rows.push([Markup.button.callback('⬅️ Меню', 'menu_home')]);
+    rows.push([Markup.button.callback('➕ Создать кошелек', 'w_new')]);
+    rows.push([Markup.button.callback('⬅️ В главное меню', 'menu_home')]);
 
-    const text = `Кошельки 👛 [ ${formatTonFromNano(total)} 💎 ]\nВсего кошельков: ${
-      wallets.length
-    }`;
+    const text = [
+      `💼 Баланс всех кошельков: ${formatTonFromNano(total)} TON`,
+      `Количество кошельков: ${wallets.length}`,
+      '',
+      'Выберите кошелек, чтобы посмотреть детали.',
+    ].join('\n');
     return sendView(ctx, text, Markup.inlineKeyboard(rows), mode);
-  } catch (err) {
-    const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Меню', 'menu_home')]]);
+  } catch {
+    const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ В главное меню', 'menu_home')]]);
     return sendView(
       ctx,
-      'Сервис кошельков недоступен. Попробуй позже.',
+      'Не удалось получить список кошельков. Попробуйте позже или обновите бота командой /start.',
       keyboard,
       mode
     );
@@ -197,7 +202,7 @@ async function renderWalletsMenu(ctx: any, mode: ViewMode = 'edit') {
 async function removeLegacyKeyboard(ctx: any) {
   if (!ctx?.chat) return;
   try {
-    const msg = await ctx.reply('Меню обновлено. Используй кнопки под сообщением 👇', {
+    const msg = await ctx.reply('Переключаюсь на новое меню…', {
       reply_markup: { remove_keyboard: true },
       disable_notification: true,
     });
@@ -210,27 +215,21 @@ async function removeLegacyKeyboard(ctx: any) {
 }
 
 const legacyReplyButtons = new Set([
-  'Мои кошельки👛',
-  '🏆 Торговый конкурс',
-  '💼 Позиции',
-  '💸 Перевод',
-  '🚀 Торговля',
-  '🤖 Копи-трейдинг',
-  '🎯 Снайпы',
-  '🧱 Лимитки [BETA]',
-  '🤝 Рефералка',
-  '🆘 Помощь',
+  '💼 Кошельки',
+  '📈 Терминал',
+  '📊 Позиции',
+  '🔁 Перевод через TON',
+  '🤝 Копитрейдинг',
+  '🎯 Снайперы',
+  '📋 Лимитные ордера (beta)',
+  '🎁 Рефералка',
+  '📚 Помощь',
   '⚙️ Настройки',
-  '📚 Руководство',
+  '🧭 Гид по боту',
 ]);
 
-// ---------- утилиты ----------
-
 async function ensurePolling() {
-
-  // снимаем webhook, если вдруг включён — иначе будет 409: Conflict
   await callTelegramBotApi('deleteWebhook', { drop_pending_updates: true }, 'deleteWebhook');
-
 }
 
 async function pingWalletApi(): Promise<boolean> {
@@ -242,22 +241,16 @@ async function pingWalletApi(): Promise<boolean> {
   }
 }
 
-// ---------- команды ----------
-
 bot.start(async (ctx) => {
-  const userId = String(ctx.from.id);
-
-  // Пытаемся проверить доступность wallet-api (создание кошелька теперь через меню)
   try {
     const alive = await pingWalletApi();
     if (!alive) {
-      await ctx.reply('😔 Сервис кошельков временно недоступен. Попробуй позже.');
+      await ctx.reply('Сервис кошельков пока не отвечает. Попробуйте чуть позже.');
     }
-  } catch (e: any) {
-    console.error('wallet-api check error:', e?.response?.data || e?.message);
+  } catch (err: any) {
+    console.error('wallet-api check error:', err?.response?.data || err?.message);
   }
 
-  // Приветствие и главное меню (inline)
   await removeLegacyKeyboard(ctx);
   await renderMainMenu(ctx, 'reply');
 });
@@ -270,16 +263,16 @@ bot.command('menu', async (ctx) => {
 bot.command('help', async (ctx) => {
   await ctx.reply(
     [
-      'ℹ️ Команды:',
-      '/start — запуск и получение кошелька',
-      '/help — эта справка',
+      'Команды:',
+      '/start — перезапуск и возврат в главное меню',
+      '/menu — показать главное меню',
+      '/help — подсказки по управлению ботом',
+      '/cancel — отменить ввод адреса/суммы или торговый диалог',
       '',
-      'Используй кнопки под последним сообщением, чтобы управлять ботом.',
+      'Все основные действия доступны через inline-меню под сообщением.',
     ].join('\n')
   );
 });
-
-// ---------- inline меню ----------
 
 bot.action('menu_home', async (ctx) => {
   await ctx.answerCbQuery();
@@ -304,86 +297,79 @@ bot.action('menu_transfer', async (ctx) => {
 registerTradingActions(bot);
 registerPositionActions(bot);
 
-const stubViews: Record<
-  string,
-  { title: string; text: string }
-> = {
+const stubViews: Record<string, { title: string; text: string }> = {
   menu_competition: {
-    title: '🏆 Торговый конкурс',
-    text: 'Скоро объявим детали конкурса и призы. Следи за новостями!'
+    title: '📈 Торговый терминал',
+    text: 'Здесь можно работать с парами, искать токены и отправлять ордера прямо из Telegram.',
   },
-  
   menu_copytrade: {
-    title: '🤖 Копи-трейдинг',
-    text: 'Копитрейдинг: список трейдеров появится позже.'
+    title: '🤝 Копитрейдинг',
+    text: 'Следите за сделками опытных трейдеров и копируйте их автоматически. Раздел скоро будет доступен.',
   },
   menu_snipes: {
-    title: '🎯 Снайпы',
-    text: 'Снайпер: скоро добавим стратегию и подписку на листинги.'
+    title: '🎯 Снайперы',
+    text: 'Автоматический мониторинг новых токенов и мгновенный вход на старте. Ведём закрытое тестирование.',
   },
   menu_limits: {
-    title: '🧱 Лимитки [BETA]',
-    text: 'Раздел лимитных ордеров готовится к запуску.'
+    title: '📋 Лимитные ордера (beta)',
+    text: 'Создание отложенных заявок и работа с лимитной книгой. Функция в публичной бете.',
   },
   menu_ref: {
-    title: '🤝 Рефералка',
-    text: 'Программа рекомендаций скоро откроется. Приглашай друзей и получай бонусы!'
+    title: '🎁 Реферальная программа',
+    text: 'Приглашайте друзей и получайте бонусы с их торговой активности. Подробности появятся совсем скоро.',
   },
   menu_help: {
-    title: '🆘 Помощь',
-    text: 'Возник вопрос? Напиши в поддержку — мы поможем как можно быстрее.'
+    title: '📚 Помощь',
+    text: 'Ответы на частые вопросы и инструкции по каждой функции бота. Если не нашли нужное — напишите нам.',
   },
   menu_settings: {
     title: '⚙️ Настройки',
-    text: 'Персональные настройки появятся в одном из ближайших релизов.'
+    text: 'Настройка уведомлений, подключение торговых стратегий и другие параметры аккаунта. Раздел в разработке.',
   },
   menu_guide: {
-    title: '📚 Руководство',
-    text: 'Готовим подробное руководство по боту. Пока что следи за обновлениями.'
+    title: '🧭 Гид по боту',
+    text: 'Пошаговое знакомство со всеми возможностями бота. Подходит для новичков и опытных пользователей.',
   },
 };
 
 Object.entries(stubViews).forEach(([action, view]) => {
-  if (action === 'menu_wallets') return;
   bot.action(action, async (ctx) => {
     await ctx.answerCbQuery();
     await sendView(
       ctx,
       `${view.title}\n\n${view.text}`,
-      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Меню', 'menu_home')]])
+      Markup.inlineKeyboard([[Markup.button.callback('⬅️ В главное меню', 'menu_home')]])
     );
   });
 });
 
 bot.action('noop', async (ctx) => {
-  await ctx.answerCbQuery('Скоро 😊');
+  await ctx.answerCbQuery('Скоро');
 });
-
-// --------------- Кошельки ---------------
 
 bot.action('w_new', async (ctx) => {
   try {
     const userId = ctx.from!.id;
-    const r = await axios
+    const response = await axios
       .post(
         `${WALLET_API}/wallets`,
         { user_id: userId },
         { timeout: 15_000, validateStatus: () => true }
       )
-      .catch((e) => e.response);
+      .catch((err) => err?.response);
 
-    if (r?.status === 400 && r.data?.error === 'limit') {
-      return ctx.answerCbQuery('🚫 Максимум 3 кошелька на пользователя.');
+    if (response?.status === 400 && response.data?.error === 'limit') {
+      return ctx.answerCbQuery('Можно создать максимум 3 кошелька на пользователя.');
     }
-    if (!r || r.status >= 400) {
-      return ctx.answerCbQuery('Ошибка сервера');
+    if (!response || response.status >= 400) {
+      return ctx.answerCbQuery('Не удалось создать кошелек. Попробуйте еще раз.');
     }
 
-    await ctx.answerCbQuery('Создан');
-    await ctx.reply(`✅ Кошелёк создан:\n<code>${r.data.address}</code>`, { parse_mode: 'HTML' });
+    await ctx.answerCbQuery('Готово');
+    await ctx.reply(`Кошелек создан:\n<code>${response.data.address}</code>`, { parse_mode: 'HTML' });
     await renderWalletsMenu(ctx);
-  } catch (e: any) {
-    await ctx.answerCbQuery('Ошибка сервера');
+  } catch {
+    await ctx.answerCbQuery('Не удалось создать кошелек');
   }
 });
 
@@ -391,35 +377,50 @@ bot.action(/^w_open_(\d+)$/, async (ctx) => {
   try {
     await ctx.answerCbQuery();
     const id = Number((ctx.match as RegExpMatchArray)[1]);
-    const { data: w } = await axios.get(`${WALLET_API}/wallets/${id}`, { timeout: 10_000 });
+    const { data: wallet } = await axios.get(`${WALLET_API}/wallets/${id}`, { timeout: 10_000 });
     let balance = '0';
     try {
-      const { data: b } = await axios.get(`${WALLET_API}/wallets/${id}/balance`, { timeout: 10_000 });
-      balance = b?.balance ?? '0';
-    } catch {}
+      const { data } = await axios.get(`${WALLET_API}/wallets/${id}/balance`, { timeout: 10_000 });
+      balance = data?.balance ?? '0';
+    } catch {
+      // ignore balance error
+    }
     let maxSendableTon = '';
     try {
-      const { data: mx } = await axios.get(`${WALLET_API}/wallets/${id}/max_sendable`, { timeout: 10_000 });
-      if (mx?.max_ton) maxSendableTon = String(mx.max_ton);
-    } catch {}
-    const ton = (Number(balance) / 1e9).toLocaleString('ru-RU', { maximumFractionDigits: 9 });
-    const lines = [
-      `Адрес: <code>${w.address}</code>`,
-      `Баланс: 💎 ${ton}`,
-    ];
-    if (maxSendableTon) lines.push(`Доступно к переводу: ${maxSendableTon} TON`);
-    const text = lines.join('\n');
+      const { data } = await axios.get(`${WALLET_API}/wallets/${id}/max_sendable`, { timeout: 10_000 });
+      if (data?.max_ton) maxSendableTon = String(data.max_ton);
+    } catch {
+      // ignore
+    }
 
-    await ctx.editMessageText(text, {
+    const ton = (Number(balance) / 1e9).toLocaleString('ru-RU', { maximumFractionDigits: 9 });
+    const parts = [
+      `Адрес: <code>${wallet.address}</code>`,
+      `Баланс: ${ton} TON`,
+    ];
+    if (maxSendableTon) {
+      parts.push(`Доступно для отправки (с учетом комиссий): ${maxSendableTon} TON`);
+    }
+
+    await ctx.editMessageText(parts.join('\n'), {
       parse_mode: 'HTML',
       ...Markup.inlineKeyboard([
-        [Markup.button.callback('Перевод ➡️', `w_send_${id}`), Markup.button.callback('Экспорт 🧾', 'w_export_all')],
-        [Markup.button.callback('Изменить имя ✍️', 'noop'), Markup.button.callback('Сид-фраза 🌿', `w_seed_${id}`)],
-        [Markup.button.callback('Удалить 🗑', 'noop'), Markup.button.callback('⬅️ Назад', 'w_back')],
+        [
+          Markup.button.callback('🚀 Отправить TON', `w_send_${id}`),
+          Markup.button.callback('📄 Список кошельков', 'w_export_all'),
+        ],
+        [
+          Markup.button.callback('Пополнить (скоро)', 'noop'),
+          Markup.button.callback('🪪 Seed/ключи', `w_seed_${id}`),
+        ],
+        [
+          Markup.button.callback('🗑 Удалить кошелек', `w_delete_${id}`),
+          Markup.button.callback('⬅️ Назад', 'w_back'),
+        ],
       ]),
     });
-  } catch (e: any) {
-    await ctx.answerCbQuery('Не удалось открыть кошелёк');
+  } catch {
+    await ctx.answerCbQuery('Не удалось показать кошелек');
   }
 });
 
@@ -428,15 +429,55 @@ bot.action('w_back', async (ctx) => {
   await renderWalletsMenu(ctx);
 });
 
-// ---- Перевод ----
+bot.action(/^w_delete_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = Number((ctx.match as RegExpMatchArray)[1]);
+  await ctx.reply(
+    'Вы действительно хотите удалить этот кошелек? Восстановить его будет невозможно.',
+    Markup.inlineKeyboard([
+      [Markup.button.callback('Да, удалить', `w_delete_confirm_${id}`)],
+      [Markup.button.callback('Отмена', `w_open_${id}`)],
+    ])
+  );
+});
+
+bot.action(/^w_delete_confirm_(\d+)$/, async (ctx) => {
+  const id = Number((ctx.match as RegExpMatchArray)[1]);
+  try {
+    const res = await axios.delete(`${WALLET_API}/wallets/${id}`, {
+      data: { user_id: ctx.from!.id },
+      timeout: 10_000,
+      validateStatus: () => true,
+    });
+    if (res.status >= 400) {
+      if (res.status === 404) {
+        await ctx.answerCbQuery('Кошелек уже удален или не найден');
+      } else {
+        await ctx.answerCbQuery('Не удалось удалить кошелек');
+      }
+      return;
+    }
+    await ctx.answerCbQuery('Удалено');
+    await ctx.reply('Кошелек удален.');
+    await renderWalletsMenu(ctx, 'reply');
+  } catch {
+    await ctx.answerCbQuery('Не удалось удалить кошелек');
+  }
+});
+
 type TransferState = { stage: 'to' | 'amount'; walletId: number; to?: string };
 const transferState = new Map<number, TransferState>();
 
 bot.action(/^w_send_(\d+)$/, async (ctx) => {
   const walletId = Number((ctx.match as RegExpMatchArray)[1]);
-  transferState.set(ctx.from!.id, { stage: 'to', walletId });
+  const fromId = ctx.from?.id;
+  if (!fromId) {
+    await ctx.answerCbQuery('Не удалось определить пользователя');
+    return;
+  }
+  transferState.set(fromId, { stage: 'to', walletId });
   await ctx.answerCbQuery();
-  await ctx.reply('Введи адрес получателя (TON):');
+  await ctx.reply('Введите TON-адрес получателя:');
 });
 
 bot.command('cancel', async (ctx) => {
@@ -444,13 +485,17 @@ bot.command('cancel', async (ctx) => {
     transferState.delete(ctx.from.id);
     await cancelTradingInput(ctx.from.id, ctx.telegram);
   }
-  await ctx.reply('Отменено.');
+  await ctx.reply('Ввод отменён.');
 });
 
 bot.on('text', async (ctx, next) => {
   const text = ctx.message?.text?.trim();
-  const st = transferState.get(ctx.from.id);
-  if (!st) {
+  const fromId = ctx.from?.id;
+  if (!fromId) {
+    return next();
+  }
+  const state = transferState.get(fromId);
+  if (!state) {
     if (text && legacyReplyButtons.has(text)) {
       await removeLegacyKeyboard(ctx);
       await renderMainMenu(ctx, 'reply');
@@ -462,44 +507,44 @@ bot.on('text', async (ctx, next) => {
     return next();
   }
 
-  if (st.stage === 'to') {
+  if (state.stage === 'to') {
     const to = ctx.message.text.trim();
     if (to.length < 10) {
-      return ctx.reply('Некорректный адрес. Введи адрес снова или /cancel');
+      return ctx.reply('Похоже, адрес слишком короткий. Попробуйте снова или отмените ввод через /cancel.');
     }
-    transferState.set(ctx.from.id, { stage: 'amount', walletId: st.walletId, to });
-    return ctx.reply('Введи сумму в TON (например 0.5):');
+    transferState.set(fromId, { stage: 'amount', walletId: state.walletId, to });
+    return ctx.reply('Введите сумму TON (минимум 0.5):');
   }
 
-  if (st.stage === 'amount') {
+  if (state.stage === 'amount') {
     const amountStr = ctx.message.text.trim().replace(',', '.');
     const amount = Number(amountStr);
     if (!isFinite(amount) || amount <= 0) {
-      return ctx.reply('Некорректная сумма. Введи число больше 0 или /cancel');
+      return ctx.reply('Неверная сумма. Введите число больше 0 или отмените ввод командой /cancel.');
     }
     try {
-      const r = await axios.post(
+      const response = await axios.post(
         `${WALLET_API}/transfer`,
-        { user_id: ctx.from.id, wallet_id: st.walletId, to: st.to, amount_ton: amount },
+        { user_id: fromId, wallet_id: state.walletId, to: state.to, amount_ton: amount },
         { timeout: 25_000, validateStatus: () => true }
       );
-      if (r.status >= 400) {
-        const code = (r.data && (r.data.error || r.data.code)) || '';
+      if (response.status >= 400) {
+        const code = (response.data && (response.data.error || response.data.code)) || '';
         if (code === 'bad_to') {
-          return ctx.reply('Адрес получателя некорректен. Проверь и отправь снова.');
+          return ctx.reply('Адрес получателя не прошел проверку. Проверьте корректность и попробуйте снова.');
         }
         if (code === 'insufficient') {
-          return ctx.reply('Недостаточно TON с учётом комиссии. Уменьши сумму или пополни баланс.');
+          return ctx.reply('Недостаточно TON на кошельке. Попробуйте уменьшить сумму.');
         }
         if (code === 'not_found') {
-          return ctx.reply('Кошелёк не найден или не принадлежит тебе. Открой нужный кошелёк и попробуй снова.');
+          return ctx.reply('Кошелек не найден. Обновите список кошельков и попробуйте снова.');
         }
-        return ctx.reply('Перевод не выполнен. Проверь данные и баланс.');
+        return ctx.reply('Не удалось отправить перевод. Попробуйте еще раз.');
       }
-      transferState.delete(ctx.from.id);
-      return ctx.reply('Готово. Перевод отправлен.');
-    } catch (e: any) {
-      return ctx.reply('Произошла ошибка при отправке. Попробуй позже.');
+      transferState.delete(fromId);
+      return ctx.reply('Перевод запущен. Как только транзакция попадет в блокчейн, вы увидите её в истории.');
+    } catch {
+      return ctx.reply('Сервис перевода временно недоступен. Попробуйте чуть позже.');
     }
   }
 });
@@ -507,23 +552,31 @@ bot.on('text', async (ctx, next) => {
 bot.action('w_export_all', async (ctx) => {
   try {
     const userId = ctx.from!.id;
-    const { data: wallets } = await axios.get(`${WALLET_API}/wallets`, { params: { user_id: userId }, timeout: 10000 });
-    if (!Array.isArray(wallets) || wallets.length === 0) return ctx.answerCbQuery('Нет кошельков');
+    const { data: wallets } = await axios.get(`${WALLET_API}/wallets`, {
+      params: { user_id: userId },
+      timeout: 10_000,
+    });
+    if (!Array.isArray(wallets) || wallets.length === 0) {
+      await ctx.answerCbQuery('Кошельков нет');
+      return;
+    }
     const list = wallets.map((w: any, i: number) => `${i + 1}. ${w.address}`).join('\n');
-    await ctx.reply(`Адреса кошельков:\n${list}`);
+    await ctx.reply(`Ваши кошельки:\n${list}`);
     await ctx.answerCbQuery();
   } catch {
-    await ctx.answerCbQuery('Ошибка');
+    await ctx.answerCbQuery('Не удалось получить список');
   }
 });
 
-// Показ сид-фразы с подтверждением
 bot.action(/^w_seed_(\d+)$/, async (ctx) => {
   const id = Number((ctx.match as RegExpMatchArray)[1]);
   await ctx.editMessageText(
-    '⚠️ Сид-фраза дает полный доступ к средствам. Держи её в секрете и не делись с кем-либо. Показать сейчас?',
+    [
+      '⚠️ Никому не передавайте seed-фразу и приватный ключ.',
+      'Если вы уверены, что хотите их посмотреть, подтвердите действие ниже.',
+    ].join('\n'),
     Markup.inlineKeyboard([
-      [Markup.button.callback('Понимаю риск — показать', `w_seed_show_${id}`)],
+      [Markup.button.callback('Показать сид-фразу', `w_seed_show_${id}`)],
       [Markup.button.callback('⬅️ Назад', `w_open_${id}`)],
     ])
   );
@@ -532,25 +585,39 @@ bot.action(/^w_seed_(\d+)$/, async (ctx) => {
 bot.action(/^w_seed_show_(\d+)$/, async (ctx) => {
   const id = Number((ctx.match as RegExpMatchArray)[1]);
   try {
-    const { data } = await axios.post(`${WALLET_API}/wallets/${id}/seed`, { user_id: ctx.from!.id, confirm: true }, { timeout: 15000 });
+    const { data } = await axios.post(
+      `${WALLET_API}/wallets/${id}/seed`,
+      { user_id: ctx.from!.id, confirm: true },
+      { timeout: 15_000 }
+    );
     const words: string = data?.mnemonic || '';
-    if (!words) return ctx.answerCbQuery('Ошибка');
-    const msg = await ctx.reply(`🌱 Сид-фраза (удали это сообщение):\n<code>${words}</code>`, { parse_mode: 'HTML' });
+    if (!words) {
+      await ctx.answerCbQuery('Не удалось получить сид-фразу');
+      return;
+    }
+    const msg = await ctx.reply(
+      `Seed-фраза (будет удалена через 30 секунд):\n<code>${words}</code>`,
+      { parse_mode: 'HTML' }
+    );
     setTimeout(async () => {
-      try { await ctx.telegram.deleteMessage(msg.chat.id, msg.message_id); } catch {}
-    }, 30000);
+      try {
+        await ctx.telegram.deleteMessage(msg.chat.id, msg.message_id);
+      } catch {
+        // ignore
+      }
+    }, 30_000);
     await ctx.answerCbQuery();
   } catch {
-    await ctx.answerCbQuery('Ошибка');
+    await ctx.answerCbQuery('Не удалось получить сид-фразу');
   }
 });
 
-// Опционально — команды в меню клиента
 async function configureBotMenu() {
   const commands = [
-    { command: 'start', description: 'Запуск и получение кошелька' },
+    { command: 'start', description: 'Сбросить диалог и открыть главное меню' },
     { command: 'menu', description: 'Показать главное меню' },
-    { command: 'help', description: 'Помощь' },
+    { command: 'help', description: 'Справка по боту' },
+    { command: 'cancel', description: 'Отменить ввод адреса/суммы' },
   ];
   try {
     await bot.telegram.setMyCommands(commands);
@@ -576,7 +643,9 @@ async function startBotWithSingleInstanceGuard() {
     if (!isGetUpdatesConflict(err)) {
       throw err;
     }
-    console.warn('Telegram returned 409 (another getUpdates session). Retrying after calling close()...');
+    console.warn(
+      'Telegram returned 409 (another getUpdates session). Retrying after calling close()...'
+    );
   }
 
   await resetTelegramPollingSession();
@@ -586,13 +655,13 @@ async function startBotWithSingleInstanceGuard() {
     console.log('Bot started after resetting polling session');
   } catch (retryErr: any) {
     if (isGetUpdatesConflict(retryErr)) {
-      throw new Error('Telegram rejected polling because another bot instance is still running. Stop the other process or use a different BOT_TOKEN.');
+      throw new Error(
+        'Telegram rejected polling because another bot instance is still running. Stop the other process or use a different BOT_TOKEN.'
+      );
     }
     throw retryErr;
   }
 }
-
-// ---------- запуск ----------
 
 (async () => {
   try {
