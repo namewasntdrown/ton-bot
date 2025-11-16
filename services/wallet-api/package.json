@@ -2,7 +2,8 @@
   "name": "wallet-api",
   "private": true,
   "scripts": {
-    "dev": "ts-node-dev --respawn --transpile-only src/main.ts"
+    "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
+    "relayer": "ts-node-dev --respawn --transpile-only src/relayer.ts"
   },
   "dependencies": {
     "@dedust/sdk": "^0.8.7",

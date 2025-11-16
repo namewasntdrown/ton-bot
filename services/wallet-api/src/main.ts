@@ -15,6 +15,7 @@ import {
   upsertTradingProfile,
   insertSwapOrder,
   upsertUserPosition,
+  deleteWalletById,
 } from './db';
 import { encryptMnemonic, decryptMnemonic } from './crypto';
 import { mnemonicNew, mnemonicToPrivateKey } from '@ton/crypto';
@@ -140,6 +141,7 @@ async function bootstrap() {
   // GET /wallets?user_id=...
   const QueryUserId = z.object({ user_id: z.coerce.number().int().nonnegative() });
   const CreateWalletDto = z.object({ user_id: z.coerce.number().int().nonnegative() });
+  const DeleteWalletDto = z.object({ user_id: z.coerce.number().int().nonnegative() });
   const TradingProfileDto = z.object({
     user_id: z.coerce.number().int().nonnegative(),
     active_wallet_id: z.coerce.number().int().positive().optional(),
@@ -319,6 +321,21 @@ async function bootstrap() {
     } catch (err: any) {
       if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
       app.log.error({ msg: err?.message, stack: err?.stack }, 'POST /wallets error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
+  app.delete('/wallets/:id', async (req, reply) => {
+    try {
+      const id = Number((req.params as any)?.id);
+      if (!id) return reply.code(400).send({ error: 'id_required' });
+      const payload = DeleteWalletDto.parse((req.body ?? {}) as any);
+      const removed = await deleteWalletById(id, payload.user_id);
+      if (!removed) return reply.code(404).send({ error: 'not_found' });
+      return reply.send({ ok: true });
+    } catch (err: any) {
+      if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'DELETE /wallets/:id error');
       return reply.code(500).send({ error: 'internal' });
     }
   });

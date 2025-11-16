@@ -154,6 +154,11 @@ export async function getWalletById(id: number) {
 
 export { pool };
 
+export async function deleteWalletById(id: number, userId: number): Promise<boolean> {
+  const r = await pool.query(`DELETE FROM wallets WHERE id = $1 AND user_id = $2`, [id, userId]);
+  return r.rowCount > 0;
+}
+
 export async function getWalletSecretById(id: number) {
   const r = await pool.query(
     `SELECT id, user_id, address, encrypted_mnemonic FROM wallets WHERE id = $1`,
