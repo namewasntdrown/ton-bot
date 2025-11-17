@@ -9,6 +9,12 @@ import {
   cancelTradingInput,
 } from './trading';
 import { renderPositionsMenu, registerPositionActions } from './features/positions';
+import {
+  renderCopytradeMenu,
+  registerCopytradeActions,
+  handleCopytradeTextInput,
+  cancelCopytradeInput,
+} from './features/copytrade';
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -128,9 +134,8 @@ async function renderMainMenu(ctx: any, mode: ViewMode = 'edit') {
   }
 
   const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback('📈 Терминал', 'menu_competition')],
+    [Markup.button.callback('торговля💱', 'menu_transfer')],
     [Markup.button.callback(walletsLabel, 'menu_wallets'), Markup.button.callback('📊 Позиции', 'menu_positions')],
-    [Markup.button.callback('🔁 Перевод через TON', 'menu_transfer')],
     [Markup.button.callback('🤝 Копитрейдинг', 'menu_copytrade'), Markup.button.callback('🎯 Снайперы', 'menu_snipes')],
     [Markup.button.callback('📋 Лимитные ордера (beta)', 'menu_limits'), Markup.button.callback('🎁 Рефералка', 'menu_ref')],
     [Markup.button.callback('📚 Помощь', 'menu_help'), Markup.button.callback('⚙️ Настройки', 'menu_settings')],
@@ -218,7 +223,7 @@ const legacyReplyButtons = new Set([
   '💼 Кошельки',
   '📈 Терминал',
   '📊 Позиции',
-  '🔁 Перевод через TON',
+  'торговля💱',
   '🤝 Копитрейдинг',
   '🎯 Снайперы',
   '📋 Лимитные ордера (beta)',
@@ -294,18 +299,16 @@ bot.action('menu_transfer', async (ctx) => {
   await renderTradingMenu(ctx);
 });
 
+bot.action('menu_copytrade', async (ctx) => {
+  await ctx.answerCbQuery();
+  await renderCopytradeMenu(ctx);
+});
+
 registerTradingActions(bot);
 registerPositionActions(bot);
+registerCopytradeActions(bot);
 
 const stubViews: Record<string, { title: string; text: string }> = {
-  menu_competition: {
-    title: '📈 Торговый терминал',
-    text: 'Здесь можно работать с парами, искать токены и отправлять ордера прямо из Telegram.',
-  },
-  menu_copytrade: {
-    title: '🤝 Копитрейдинг',
-    text: 'Следите за сделками опытных трейдеров и копируйте их автоматически. Раздел скоро будет доступен.',
-  },
   menu_snipes: {
     title: '🎯 Снайперы',
     text: 'Автоматический мониторинг новых токенов и мгновенный вход на старте. Ведём закрытое тестирование.',
@@ -483,6 +486,7 @@ bot.action(/^w_send_(\d+)$/, async (ctx) => {
 bot.command('cancel', async (ctx) => {
   if (ctx.from?.id) {
     transferState.delete(ctx.from.id);
+    cancelCopytradeInput(ctx.from.id);
     await cancelTradingInput(ctx.from.id, ctx.telegram);
   }
   await ctx.reply('Ввод отменён.');
@@ -493,6 +497,9 @@ bot.on('text', async (ctx, next) => {
   const fromId = ctx.from?.id;
   if (!fromId) {
     return next();
+  }
+  if (await handleCopytradeTextInput(ctx, text)) {
+    return;
   }
   const state = transferState.get(fromId);
   if (!state) {

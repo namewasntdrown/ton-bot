@@ -16,11 +16,18 @@ import {
   insertSwapOrder,
   upsertUserPosition,
   deleteWalletById,
+  createCopytradeProfile,
+  listCopytradeProfilesByUser,
+  updateCopytradeProfile,
+  replaceCopytradeProfileWallets,
+  listCopytradeProfilesBySource,
+  listActiveCopytradeSources,
 } from './db';
 import { encryptMnemonic, decryptMnemonic } from './crypto';
 import { mnemonicNew, mnemonicToPrivateKey } from '@ton/crypto';
 import { WalletContractV4, Address, internal, toNano, beginCell, TonClient, SendMode } from '@ton/ton';
 import { SwapRelayer } from './relayer';
+import { fanoutCopytradeOrder, fanoutCopytradeSignal } from './copytrade';
 import { registerPositionRoutes } from './routes/positions';
 import { asBooleanFlag } from './utils/flags';
 
@@ -42,6 +49,11 @@ const PORT = Number(process.env.PORT || 8090);
 // Default to mainnet unless overridden by env
 const TON_RPC = process.env.TON_RPC_ENDPOINT || 'https://toncenter.com/api/v2/jsonRPC';
 const TON_API_KEY = process.env.TONCENTER_API_KEY || undefined;
+const SELL_MIN_TON_FOR_SELL_STR = process.env.SELL_MIN_TON_FOR_SELL || '0.26';
+const SELL_MIN_TON_FOR_SELL_NANO = toNano(SELL_MIN_TON_FOR_SELL_STR);
+const COPYTRADE_PLATFORM_VALUES = ['stonfi', 'dedust', 'tonfun', 'gaspump', 'memeslab', 'blum'] as const;
+type CopytradePlatform = (typeof COPYTRADE_PLATFORM_VALUES)[number];
+const tonClient = new TonClient({ endpoint: TON_RPC, apiKey: TON_API_KEY });
 
 function nanoToTonString(n: bigint) {
   const s = n.toString();
@@ -69,6 +81,26 @@ function addressVariants(addr: string) {
   };
 }
 
+function normalizeFriendlyAddress(value?: string | null): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = Address.parseFriendly(trimmed);
+    return parsed.address.toString({ bounceable: false, urlSafe: true });
+  } catch {
+    try {
+      return Address.parse(trimmed).toString({ bounceable: false, urlSafe: true });
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function loadCopytradeProfile(userId: number, profileId: number) {
+  const profiles = await listCopytradeProfilesByUser(userId);
+  return profiles.find((p) => p.id === profileId) || null;
+}
+
 async function bootstrap() {
   const app = Fastify({ logger: true });
   await app.register(cors, { origin: true });
@@ -85,11 +117,10 @@ async function bootstrap() {
     >
   > => {
     if (!rows.length) return rows as any;
-    const client = new (TonClient as any)({ endpoint: TON_RPC, apiKey: TON_API_KEY });
     return Promise.all(
       rows.map(async (row) => {
         try {
-          const balance = await client.getBalance(Address.parse(row.address));
+          const balance = await tonClient.getBalance(Address.parse(row.address));
           return {
             ...row,
             balance_nton: balance.toString(),
@@ -158,6 +189,41 @@ async function bootstrap() {
     token_symbol: z.string().trim().max(64).optional(),
     token_name: z.string().trim().max(128).optional(),
     token_image: z.string().trim().max(512).optional(),
+  });
+  const CopytradeProfileCreateDto = z.object({
+    user_id: z.coerce.number().int().nonnegative(),
+  });
+  const CopytradePlatformEnum = z.enum(COPYTRADE_PLATFORM_VALUES);
+  const CopytradeProfileUpdateDto = z.object({
+    user_id: z.coerce.number().int().nonnegative(),
+    source_address: z.string().trim().min(48).max(66).optional(),
+    name: z.string().trim().max(64).optional(),
+    smart_mode: z.boolean().optional(),
+    manual_amount_ton: z.coerce.number().positive().optional(),
+    slippage_percent: z.coerce.number().positive().optional(),
+    copy_buy: z.boolean().optional(),
+    copy_sell: z.boolean().optional(),
+    platforms: z
+      .array(CopytradePlatformEnum)
+      .max(COPYTRADE_PLATFORM_VALUES.length)
+      .optional(),
+    status: z.enum(['idle', 'running']).optional(),
+  });
+  const CopytradeWalletsDto = z.object({
+    user_id: z.coerce.number().int().nonnegative(),
+    wallet_ids: z
+      .array(z.coerce.number().int().positive())
+      .max(10)
+      .optional(),
+  });
+  const CopytradeSignalDto = z.object({
+    source_address: z.string().trim().min(48).max(66),
+    direction: z.enum(['buy', 'sell']),
+    token_address: z.string().trim().min(48).max(66),
+    ton_amount: z.coerce.number().positive(),
+    limit_price: z.coerce.number().positive().optional(),
+    sell_percent: z.coerce.number().positive().optional(),
+    platform: CopytradePlatformEnum.optional(),
   });
   const SwapRequestDto = z.object({
     user_id: z.coerce.number().int().nonnegative(),
@@ -241,6 +307,25 @@ async function bootstrap() {
       if (!walletRow || walletRow.user_id !== payload.user_id) {
         return reply.code(404).send({ error: 'wallet_not_found' });
       }
+      if (payload.direction === 'sell') {
+        let balance: bigint;
+        try {
+          balance = await tonClient.getBalance(Address.parse(walletRow.address));
+        } catch (err: any) {
+          app.log.warn(
+            { msg: err?.message, walletId: walletRow.id, address: walletRow.address },
+            'wallet_balance_fetch_failed_swap'
+          );
+          return reply.code(503).send({ error: 'ton_balance_unavailable' });
+        }
+        if (balance < SELL_MIN_TON_FOR_SELL_NANO) {
+          return reply.code(400).send({
+            error: 'low_ton_balance',
+            required_ton: SELL_MIN_TON_FOR_SELL_STR,
+            balance_ton: nanoToTonString(balance),
+          });
+        }
+      }
       const order = await insertSwapOrder({
         user_id: payload.user_id,
         wallet_id: payload.wallet_id,
@@ -250,6 +335,9 @@ async function bootstrap() {
         limit_price: payload.limit_price ?? null,
         sell_percent: payload.sell_percent ?? null,
       });
+      fanoutCopytradeOrder(order, app.log).catch((err) =>
+        app.log.error({ msg: err?.message || err }, 'copytrade_fanout_error')
+      );
       if (
         payload.direction === 'buy' &&
         payload.position_hint?.token_amount &&
@@ -321,6 +409,131 @@ async function bootstrap() {
     } catch (err: any) {
       if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
       app.log.error({ msg: err?.message, stack: err?.stack }, 'POST /wallets error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
+  app.get('/copytrade/profiles', async (req, reply) => {
+    try {
+      const { user_id } = QueryUserId.parse((req.query ?? {}) as any);
+      const profiles = await listCopytradeProfilesByUser(user_id);
+      return reply.send(profiles);
+    } catch (err: any) {
+      if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'GET /copytrade/profiles error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
+  app.get('/copytrade/sources', async (_req, reply) => {
+    try {
+      const sources = await listActiveCopytradeSources();
+      return reply.send(sources);
+    } catch (err: any) {
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'GET /copytrade/sources error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
+  app.post('/copytrade/profiles', async (req, reply) => {
+    try {
+      const { user_id } = CopytradeProfileCreateDto.parse((req.body ?? {}) as any);
+      const profile = await createCopytradeProfile(user_id);
+      return reply.code(201).send(profile);
+    } catch (err: any) {
+      if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'POST /copytrade/profiles error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
+  app.patch('/copytrade/profiles/:id', async (req, reply) => {
+    const profileId = Number((req.params as any)?.id);
+    if (!profileId) {
+      return reply.code(400).send({ error: 'id_required' });
+    }
+    try {
+      const payload = CopytradeProfileUpdateDto.parse((req.body ?? {}) as any);
+      const normalizedAddress =
+        payload.source_address !== undefined
+          ? normalizeFriendlyAddress(payload.source_address)
+          : undefined;
+      if (payload.source_address !== undefined && !normalizedAddress) {
+        return reply.code(400).send({ error: 'invalid_source_address' });
+      }
+      const updated = await updateCopytradeProfile(profileId, payload.user_id, {
+        source_address: normalizedAddress,
+        name: payload.name,
+        smart_mode: payload.smart_mode,
+        manual_amount_ton: payload.manual_amount_ton,
+        slippage_percent: payload.slippage_percent,
+        copy_buy: payload.copy_buy,
+        copy_sell: payload.copy_sell,
+        platforms: payload.platforms,
+        status: payload.status,
+      });
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const profile = await loadCopytradeProfile(payload.user_id, profileId);
+      return reply.send(profile || { ...updated, wallets: [] });
+    } catch (err: any) {
+      if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
+      if (err?.message === 'profile_not_found') {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'PATCH /copytrade/profiles/:id error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
+  app.post('/copytrade/profiles/:id/wallets', async (req, reply) => {
+    const profileId = Number((req.params as any)?.id);
+    if (!profileId) return reply.code(400).send({ error: 'id_required' });
+    try {
+      const payload = CopytradeWalletsDto.parse((req.body ?? {}) as any);
+      const walletIds = payload.wallet_ids ?? [];
+      await replaceCopytradeProfileWallets(profileId, payload.user_id, walletIds);
+      const profile = await loadCopytradeProfile(payload.user_id, profileId);
+      if (!profile) return reply.code(404).send({ error: 'not_found' });
+      return reply.send(profile);
+    } catch (err: any) {
+      if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
+      if (err?.message === 'profile_not_found') {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'POST /copytrade/profiles/:id/wallets error');
+      return reply.code(500).send({ error: 'internal' });
+    }
+  });
+
+  app.post('/copytrade/signals', async (req, reply) => {
+    try {
+      const payload = CopytradeSignalDto.parse((req.body ?? {}) as any);
+      const normalizedSource = normalizeFriendlyAddress(payload.source_address);
+      const normalizedToken = normalizeFriendlyAddress(payload.token_address);
+      if (!normalizedSource) {
+        return reply.code(400).send({ error: 'invalid_source_address' });
+      }
+      if (!normalizedToken) {
+        return reply.code(400).send({ error: 'invalid_token_address' });
+      }
+      await fanoutCopytradeSignal(
+        {
+          sourceAddress: normalizedSource,
+          direction: payload.direction,
+          tokenAddress: normalizedToken,
+          tonAmount: payload.ton_amount,
+          limitPriceTon: payload.limit_price,
+          sellPercent: payload.sell_percent,
+          platform: payload.platform,
+        },
+        app.log
+      );
+      return reply.send({ ok: true });
+    } catch (err: any) {
+      if (err?.issues) return reply.code(400).send({ error: 'bad_request' });
+      app.log.error({ msg: err?.message, stack: err?.stack }, 'POST /copytrade/signals error');
       return reply.code(500).send({ error: 'internal' });
     }
   });

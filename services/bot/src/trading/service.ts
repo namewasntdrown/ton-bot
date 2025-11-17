@@ -548,6 +548,7 @@ export async function submitSwapOrder(
     const code = response.data?.error || 'swap_failed';
     const error = new Error(code);
     (error as any).code = code;
+    (error as any).details = response.data;
     throw error;
   }
   return response.data;

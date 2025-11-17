@@ -26,6 +26,7 @@ import {
 import { sendView, ViewMode } from '../utils/telegram';
 
 const userLastToken = new Map<number, string>();
+const MIN_TON_BALANCE_FOR_SELL = Number(process.env.SELL_MIN_TON_FOR_SELL ?? '0.26');
 
 type TradingPromptKind = 'ton_amount' | 'sell_percent' | 'limit_price';
 type TradingPromptState = {
@@ -824,6 +825,21 @@ export function registerTradingActions(bot: Telegraf<any>) {
         return;
       }
       const direction: 'buy' | 'sell' = profile.trade_mode === 'sell' ? 'sell' : 'buy';
+      const tonBalance =
+        wallet.balance_nton && !Number.isNaN(Number(wallet.balance_nton))
+          ? Number(wallet.balance_nton) / 1_000_000_000
+          : 0;
+      if (direction === 'sell' && tonBalance < MIN_TON_BALANCE_FOR_SELL) {
+        await ctx.answerCbQuery('Мало TON');
+        await ctx.reply(
+          [
+            `На кошельке ${shortAddress(wallet.address)} недостаточно TON для оплаты комиссии свапа.`,
+            `Баланс: ${tonBalance.toFixed(4)} TON · нужно минимум ${MIN_TON_BALANCE_FOR_SELL.toFixed(2)} TON.`,
+            'Пополните кошелёк или переведите немного TON и повторите попытку.',
+          ].join('\n')
+        );
+        return;
+      }
       const tonAmount =
         profile.ton_amount && profile.ton_amount > 0
           ? profile.ton_amount
@@ -892,6 +908,16 @@ export function registerTradingActions(bot: Telegraf<any>) {
       let message = 'Не удалось отправить свап. Попробуй ещё раз позже.';
       if (code === 'wallet_not_found') {
         message = 'Кошелёк не найден. Создай и привяжи кошелёк.';
+      } else if (code === 'low_ton_balance' || code === 'insufficient_ton_for_fees') {
+        const required =
+          Number(err?.details?.required_ton ?? MIN_TON_BALANCE_FOR_SELL) ||
+          MIN_TON_BALANCE_FOR_SELL;
+        message = [
+          'На выбранном кошельке недостаточно TON для оплаты комиссии свапа.',
+          `Нужно минимум ${required.toFixed(2)} TON. Пополни кошелёк и повтори попытку.`,
+        ].join('\n');
+      } else if (code === 'ton_balance_unavailable') {
+        message = 'Не удалось проверить баланс TON кошелька. Попробуй ещё раз через минуту.';
       }
       await ctx.answerCbQuery('Ошибка');
       await ctx.reply(message);

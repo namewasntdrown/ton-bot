@@ -93,7 +93,33 @@ export async function migrate() {
       ADD COLUMN IF NOT EXISTS limit_price NUMERIC,
       ADD COLUMN IF NOT EXISTS error TEXT,
       ADD COLUMN IF NOT EXISTS tx_hash TEXT,
+      ADD COLUMN IF NOT EXISTS copytrade_parent_id BIGINT REFERENCES swap_orders(id),
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+    CREATE TABLE IF NOT EXISTS copytrade_profiles (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL,
+      source_address TEXT,
+      name TEXT,
+      smart_mode BOOLEAN NOT NULL DEFAULT TRUE,
+      manual_amount_ton NUMERIC,
+      slippage_percent NUMERIC NOT NULL DEFAULT 100,
+      copy_buy BOOLEAN NOT NULL DEFAULT TRUE,
+      copy_sell BOOLEAN NOT NULL DEFAULT FALSE,
+      platforms TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+      status TEXT NOT NULL DEFAULT 'idle',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_copytrade_profiles_user ON copytrade_profiles(user_id);
+    CREATE INDEX IF NOT EXISTS idx_copytrade_profiles_source ON copytrade_profiles(source_address);
+
+    CREATE TABLE IF NOT EXISTS copytrade_profile_wallets (
+      id BIGSERIAL PRIMARY KEY,
+      profile_id BIGINT NOT NULL REFERENCES copytrade_profiles(id) ON DELETE CASCADE,
+      wallet_id BIGINT NOT NULL REFERENCES wallets(id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_copytrade_profile_wallet_unique ON copytrade_profile_wallets(profile_id, wallet_id);
 
     CREATE TABLE IF NOT EXISTS user_positions (
       id BIGSERIAL PRIMARY KEY,
@@ -242,6 +268,7 @@ export type SwapOrderRow = {
   ton_amount: string;
   limit_price: string | null;
   sell_percent: string | null;
+  copytrade_parent_id: number | null;
   status: string;
   error: string | null;
   tx_hash: string | null;
@@ -257,12 +284,13 @@ export async function insertSwapOrder(row: {
   ton_amount: number;
   limit_price?: number | null;
   sell_percent?: number | null;
+  copytrade_parent_id?: number | null;
 }): Promise<SwapOrderRow> {
   const r = await pool.query(
-    `INSERT INTO swap_orders (user_id, wallet_id, token_address, direction, ton_amount, limit_price, sell_percent)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `INSERT INTO swap_orders (user_id, wallet_id, token_address, direction, ton_amount, limit_price, sell_percent, copytrade_parent_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING id, user_id, wallet_id, token_address, direction, ton_amount::text, limit_price::text, sell_percent::text,
-               status, error, tx_hash, created_at, updated_at`,
+               copytrade_parent_id, status, error, tx_hash, created_at, updated_at`,
     [
       row.user_id,
       row.wallet_id,
@@ -271,6 +299,7 @@ export async function insertSwapOrder(row: {
       row.ton_amount,
       row.limit_price ?? null,
       row.sell_percent ?? null,
+      row.copytrade_parent_id ?? null,
     ]
   );
   return r.rows[0] as SwapOrderRow;
@@ -290,7 +319,7 @@ export async function updateSwapOrderStatus(
          updated_at = NOW()
      WHERE id = $1
      RETURNING id, user_id, wallet_id, token_address, direction, ton_amount::text, limit_price::text, sell_percent::text,
-               status, error, tx_hash, created_at, updated_at`,
+               copytrade_parent_id, status, error, tx_hash, created_at, updated_at`,
     [id, status, error, tx_hash]
   );
   return (r.rows[0] as SwapOrderRow) || null;
@@ -303,7 +332,7 @@ export async function claimNextSwapOrder(): Promise<SwapOrderRow | null> {
     const selection = await client.query<SwapOrderRow>(
       `SELECT id, user_id, wallet_id, token_address, direction,
               ton_amount::text, limit_price::text, sell_percent::text,
-              status, error, tx_hash, created_at, updated_at
+              copytrade_parent_id, status, error, tx_hash, created_at, updated_at
          FROM swap_orders
         WHERE status = 'queued'
         ORDER BY created_at ASC
@@ -323,7 +352,7 @@ export async function claimNextSwapOrder(): Promise<SwapOrderRow | null> {
         WHERE id = $1
         RETURNING id, user_id, wallet_id, token_address, direction,
                   ton_amount::text, limit_price::text, sell_percent::text,
-                  status, error, tx_hash, created_at, updated_at`,
+                  copytrade_parent_id, status, error, tx_hash, created_at, updated_at`,
       [row.id]
     );
     await client.query('COMMIT');
@@ -425,4 +454,230 @@ export async function setUserPositionHidden(
     [positionId, userId, hidden]
   );
   return r.rows[0] || null;
+}
+
+export type CopytradeProfileRow = {
+  id: number;
+  user_id: number;
+  source_address: string | null;
+  name: string | null;
+  smart_mode: boolean;
+  manual_amount_ton: string | null;
+  slippage_percent: string | null;
+  copy_buy: boolean;
+  copy_sell: boolean;
+  platforms: string[] | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CopytradeProfileWithWallets = CopytradeProfileRow & {
+  wallets: { id: number; address: string }[];
+};
+
+export async function createCopytradeProfile(userId: number) {
+  const r = await pool.query(
+    `INSERT INTO copytrade_profiles (user_id)
+     VALUES ($1)
+     RETURNING id, user_id, source_address, name, smart_mode, manual_amount_ton::text,
+               slippage_percent::text, copy_buy, copy_sell, platforms, status, created_at, updated_at`,
+    [userId]
+  );
+  return { ...(r.rows[0] as CopytradeProfileRow), wallets: [] };
+}
+
+export async function listCopytradeProfilesByUser(
+  userId: number
+): Promise<CopytradeProfileWithWallets[]> {
+  const r = await pool.query(
+    `SELECT p.id,
+            p.user_id,
+            p.source_address,
+            p.name,
+            p.smart_mode,
+            p.manual_amount_ton::text,
+            p.slippage_percent::text,
+            p.copy_buy,
+            p.copy_sell,
+            p.platforms,
+            p.status,
+            p.created_at,
+            p.updated_at,
+            COALESCE(
+              json_agg(
+                CASE WHEN w.id IS NULL THEN NULL ELSE json_build_object('id', w.id, 'address', w.address) END
+              ) FILTER (WHERE w.id IS NOT NULL),
+              '[]'
+            ) AS wallets
+     FROM copytrade_profiles p
+     LEFT JOIN copytrade_profile_wallets cw ON cw.profile_id = p.id
+     LEFT JOIN wallets w ON w.id = cw.wallet_id
+     WHERE p.user_id = $1
+     GROUP BY p.id
+     ORDER BY p.id ASC`,
+    [userId]
+  );
+  return r.rows.map((row) => ({
+    id: Number(row.id),
+    user_id: Number(row.user_id),
+    source_address: row.source_address,
+    name: row.name,
+    smart_mode: row.smart_mode,
+    manual_amount_ton: row.manual_amount_ton,
+    slippage_percent: row.slippage_percent,
+    copy_buy: row.copy_buy,
+    copy_sell: row.copy_sell,
+    platforms: row.platforms,
+    status: row.status,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    wallets: Array.isArray(row.wallets)
+      ? row.wallets.map((w: any) => ({ id: Number(w.id), address: String(w.address) }))
+      : [],
+  }));
+}
+
+export async function updateCopytradeProfile(
+  profileId: number,
+  userId: number,
+  patch: Partial<{
+    source_address: string | null;
+    name: string | null;
+    smart_mode: boolean;
+    manual_amount_ton: number | null;
+    slippage_percent: number | null;
+    copy_buy: boolean;
+    copy_sell: boolean;
+    platforms: string[] | null;
+    status: string;
+  }>
+): Promise<CopytradeProfileRow | null> {
+  const fields: string[] = [];
+  const values: any[] = [];
+  let idx = 1;
+  const setField = (sql: string, value: any) => {
+    fields.push(`${sql} = $${idx}`);
+    values.push(value);
+    idx += 1;
+  };
+  if (patch.source_address !== undefined) setField('source_address', patch.source_address);
+  if (patch.name !== undefined) setField('name', patch.name);
+  if (patch.smart_mode !== undefined) setField('smart_mode', patch.smart_mode);
+  if (patch.manual_amount_ton !== undefined) setField('manual_amount_ton', patch.manual_amount_ton);
+  if (patch.slippage_percent !== undefined) setField('slippage_percent', patch.slippage_percent);
+  if (patch.copy_buy !== undefined) setField('copy_buy', patch.copy_buy);
+  if (patch.copy_sell !== undefined) setField('copy_sell', patch.copy_sell);
+  if (patch.platforms !== undefined) setField('platforms', patch.platforms);
+  if (patch.status !== undefined) setField('status', patch.status);
+  if (!fields.length) return null;
+  fields.push('updated_at = NOW()');
+  const r = await pool.query(
+    `UPDATE copytrade_profiles
+        SET ${fields.join(', ')}
+      WHERE id = $${idx}
+        AND user_id = $${idx + 1}
+      RETURNING id, user_id, source_address, name, smart_mode, manual_amount_ton::text,
+                slippage_percent::text, copy_buy, copy_sell, platforms, status, created_at, updated_at`,
+    [...values, profileId, userId]
+  );
+  return (r.rows[0] as CopytradeProfileRow) || null;
+}
+
+export async function replaceCopytradeProfileWallets(
+  profileId: number,
+  userId: number,
+  walletIds: number[]
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const existing = await client.query(
+      `SELECT 1 FROM copytrade_profiles WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+      [profileId, userId]
+    );
+    if (!existing.rowCount) {
+      await client.query('ROLLBACK');
+      throw new Error('profile_not_found');
+    }
+    await client.query(`DELETE FROM copytrade_profile_wallets WHERE profile_id = $1`, [profileId]);
+    if (walletIds.length) {
+      const placeholders = walletIds.map((_, i) => `($1, $${i + 2})`).join(',');
+      await client.query(
+        `INSERT INTO copytrade_profile_wallets (profile_id, wallet_id) VALUES ${placeholders}`,
+        [profileId, ...walletIds]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export async function listCopytradeProfilesBySource(address: string) {
+  const r = await pool.query(
+    `SELECT p.id,
+            p.user_id,
+            p.source_address,
+            p.name,
+            p.smart_mode,
+            p.manual_amount_ton::text,
+            p.slippage_percent::text,
+            p.copy_buy,
+            p.copy_sell,
+            p.platforms,
+            p.status,
+            p.created_at,
+            p.updated_at,
+            COALESCE(array_agg(cw.wallet_id) FILTER (WHERE cw.wallet_id IS NOT NULL), '{}') AS wallet_ids
+     FROM copytrade_profiles p
+     LEFT JOIN copytrade_profile_wallets cw ON cw.profile_id = p.id
+     WHERE p.source_address = $1
+       AND p.status = 'running'
+     GROUP BY p.id`,
+    [address]
+  );
+  return r.rows.map((row) => ({
+    id: Number(row.id),
+    user_id: Number(row.user_id),
+    source_address: row.source_address,
+    name: row.name,
+    smart_mode: row.smart_mode,
+    manual_amount_ton: row.manual_amount_ton,
+    slippage_percent: row.slippage_percent,
+    copy_buy: row.copy_buy,
+    copy_sell: row.copy_sell,
+    platforms: row.platforms,
+    status: row.status,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    wallet_ids: Array.isArray(row.wallet_ids)
+      ? row.wallet_ids.map((id: any) => Number(id))
+      : [],
+  }));
+}
+
+export async function listActiveCopytradeSources(): Promise<
+  Array<{ source_address: string; profile_ids: number[]; updated_at: string }>
+> {
+  const r = await pool.query(
+    `SELECT source_address,
+            array_agg(id) AS profile_ids,
+            MAX(updated_at) AS updated_at
+       FROM copytrade_profiles
+      WHERE status = 'running'
+        AND source_address IS NOT NULL
+      GROUP BY source_address`,
+    []
+  );
+  return r.rows.map((row) => ({
+    source_address: row.source_address,
+    profile_ids: Array.isArray(row.profile_ids)
+      ? row.profile_ids.map((id: any) => Number(id))
+      : [],
+    updated_at: row.updated_at,
+  }));
 }
